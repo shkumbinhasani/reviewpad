@@ -1,19 +1,42 @@
 #!/bin/sh
+# Build ReviewPad and wrap it in a Finder-launchable .app bundle.
+#
+#   ./scripts/bundle-macos.sh              # host architecture
+#   UNIVERSAL=1 ./scripts/bundle-macos.sh  # arm64 + x86_64, as released
+#   VERSION=1.2.3 ./scripts/bundle-macos.sh
 set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$PROJECT_DIR"
 
-cargo build --release
+VERSION=${VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)}
+DIST="$PROJECT_DIR/dist"
+BUNDLE="$DIST/ReviewPad.app"
 
-BUNDLE_DIR="$PROJECT_DIR/target/release/ReviewPad.app"
-CONTENTS_DIR="$BUNDLE_DIR/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
+mkdir -p "$DIST"
 
-mkdir -p "$MACOS_DIR"
-cp "$PROJECT_DIR/target/release/reviewpad" "$MACOS_DIR/reviewpad"
-cp "$PROJECT_DIR/packaging/macos/reviewpad-launcher" "$MACOS_DIR/reviewpad-launcher"
-cp "$PROJECT_DIR/packaging/macos/Info.plist" "$CONTENTS_DIR/Info.plist"
-chmod +x "$MACOS_DIR/reviewpad" "$MACOS_DIR/reviewpad-launcher"
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    cargo build --release --target aarch64-apple-darwin
+    cargo build --release --target x86_64-apple-darwin
+    lipo -create -output "$DIST/reviewpad" \
+        "target/aarch64-apple-darwin/release/reviewpad" \
+        "target/x86_64-apple-darwin/release/reviewpad"
+else
+    cargo build --release
+    cp "target/release/reviewpad" "$DIST/reviewpad"
+fi
 
-echo "$BUNDLE_DIR"
+rm -rf "$BUNDLE"
+mkdir -p "$BUNDLE/Contents/MacOS"
+
+cp "$DIST/reviewpad" "$BUNDLE/Contents/MacOS/reviewpad"
+cp "packaging/macos/reviewpad-launcher" "$BUNDLE/Contents/MacOS/reviewpad-launcher"
+sed "s/__VERSION__/$VERSION/g" "packaging/macos/Info.plist" > "$BUNDLE/Contents/Info.plist"
+chmod +x "$BUNDLE/Contents/MacOS/reviewpad" "$BUNDLE/Contents/MacOS/reviewpad-launcher"
+
+# Ad-hoc signature with a stable identifier: unsigned bundles are killed by
+# Gatekeeper on first launch, and a stable id keeps the identity across updates.
+codesign --force --deep --sign - --identifier dev.reviewpad.ReviewPad "$BUNDLE"
+
+echo "$BUNDLE"

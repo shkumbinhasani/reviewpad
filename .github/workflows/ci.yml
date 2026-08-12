@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # GPUI compiles its Metal shaders at build time with `xcrun metal`, which
+      # ships as a separate Xcode component from Xcode 16 onward.
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent metalToolchain
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+  bundle:
+    name: Bundle the app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent metalToolchain
+
+      # Proves the packaging path still works on every change, so a release tag
+      # is never the first time the bundle is exercised.
+      - name: Bundle
+        run: ./scripts/bundle-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReviewPad-app
+          path: dist/ReviewPad.app
+          retention-days: 7

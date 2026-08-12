@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent metalToolchain
+
+      - name: Read the version from the tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # The tag is the single source of truth for the version, so a mismatched
+      # Cargo.toml fails here rather than shipping a binary that misreports
+      # itself and then never sees the update as newer.
+      - name: Verify the manifest matches the tag
+        run: |
+          MANIFEST=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "Cargo.toml is $MANIFEST but the tag is $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build the universal bundle
+        env:
+          UNIVERSAL: '1'
+        run: ./scripts/bundle-macos.sh
+
+      - name: Package
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent ReviewPad.app ReviewPad-macos-universal.zip
+          tar -czf reviewpad-macos-universal.tar.gz reviewpad
+          shasum -a 256 ReviewPad-macos-universal.zip reviewpad-macos-universal.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The manifest the in-app updater polls. It lives on the release itself,
+      # so `releases/latest/download/latest.json` always names the newest build
+      # without spending an API call or a rate-limit token.
+      - name: Write the update manifest
+        run: |
+          cd dist
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          APP_SHA=$(shasum -a 256 ReviewPad-macos-universal.zip | awk '{print $1}')
+          CLI_SHA=$(shasum -a 256 reviewpad-macos-universal.tar.gz | awk '{print $1}')
+          cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${GITHUB_REF_NAME}",
+            "notes": "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}",
+            "app": {
+              "url": "${BASE}/ReviewPad-macos-universal.zip",
+              "sha256": "${APP_SHA}"
+            },
+            "cli": {
+              "url": "${BASE}/reviewpad-macos-universal.tar.gz",
+              "sha256": "${CLI_SHA}"
+            }
+          }
+          EOF
+          cat latest.json
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ReviewPad-macos-universal.zip
+            dist/reviewpad-macos-universal.tar.gz
+            dist/SHA256SUMS
+            dist/latest.json
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

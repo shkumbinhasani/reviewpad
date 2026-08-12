@@ -2,8 +2,8 @@ mod app;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reviewpad::{git::Repository, review::Review};
-use std::path::PathBuf;
+use reviewpad::{git::Repository, review::Review, update};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,6 +44,12 @@ enum Command {
     },
     /// Open a native directory picker, then review the selected repository.
     Pick,
+    /// Download and install the newest release.
+    Update {
+        /// Report whether an update exists without installing it.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() {
@@ -71,9 +77,16 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Pick) => app::pick_and_run(),
+        Some(Command::Update { check }) => {
+            if check {
+                update::check()
+            } else {
+                update::install()
+            }
+        }
         None => match open(cli.path.clone(), false) {
             Ok(()) => Ok(()),
-            Err(_) if cli.path == PathBuf::from(".") => app::pick_and_run(),
+            Err(_) if cli.path == Path::new(".") => app::pick_and_run(),
             Err(error) => Err(error),
         },
     }

@@ -1,0 +1,312 @@
+//! Self-update against the GitHub release that CI publishes.
+//!
+//! Every release carries a `latest.json` manifest, and GitHub resolves
+//! `releases/latest/download/<asset>` to the newest release, so a single
+//! unauthenticated fetch answers "is there something newer?" without spending
+//! an API rate-limit token.
+//!
+//! Homebrew installs are deliberately left alone: rewriting a file Homebrew
+//! tracks would desynchronize its manifest, so those are told to `brew upgrade`
+//! instead.
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{env, fs, path::Path, process::Command, time::Duration};
+
+const MANIFEST_URL: &str =
+    "https://github.com/shkumbinhasani/reviewpad/releases/latest/download/latest.json";
+const TIMEOUT: Duration = Duration::from_secs(20);
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Manifest {
+    pub version: String,
+    pub tag: String,
+    pub notes: String,
+    pub cli: Asset,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Asset {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// How this copy of ReviewPad got onto the machine, which decides whether it
+/// may replace itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Install {
+    Homebrew,
+    Standalone,
+}
+
+impl Install {
+    pub fn detect() -> Self {
+        match env::current_exe() {
+            Ok(path) => Self::for_path(&path),
+            Err(_) => Install::Standalone,
+        }
+    }
+
+    fn for_path(path: &Path) -> Self {
+        let path = path.to_string_lossy();
+        if path.contains("/Caskroom/") || path.contains("/Cellar/") {
+            Install::Homebrew
+        } else {
+            Install::Standalone
+        }
+    }
+
+    pub fn upgrade_hint(self) -> &'static str {
+        match self {
+            Install::Homebrew => "brew upgrade --cask reviewpad",
+            Install::Standalone => "reviewpad update",
+        }
+    }
+}
+
+/// Fetch the manifest for the newest release. `None` means the check failed —
+/// an offline machine is not an error worth interrupting a review for.
+pub fn latest() -> Option<Manifest> {
+    fetch_manifest().ok()
+}
+
+fn fetch_manifest() -> Result<Manifest> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .user_agent(concat!("reviewpad/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .new_agent();
+
+    let manifest = agent
+        .get(MANIFEST_URL)
+        .call()
+        .context("could not reach the release feed")?
+        .body_mut()
+        .read_json::<Manifest>()
+        .context("the release feed was not the manifest we expected")?;
+
+    Ok(manifest)
+}
+
+/// Whether `candidate` is a newer release than what is running, comparing
+/// dotted numeric components so `0.10.0` sorts above `0.9.0`.
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(version: &str) -> Vec<u64> {
+        version
+            .trim_start_matches('v')
+            // Drop any pre-release suffix: `1.2.0-rc.1` compares as `1.2.0`.
+            .split('-')
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    }
+
+    let (candidate, current) = (parts(candidate), parts(current));
+    let width = candidate.len().max(current.len());
+    for index in 0..width {
+        let (new, old) = (
+            candidate.get(index).copied().unwrap_or(0),
+            current.get(index).copied().unwrap_or(0),
+        );
+        if new != old {
+            return new > old;
+        }
+    }
+    false
+}
+
+/// Print whether a newer release exists, without touching anything on disk.
+pub fn check() -> Result<()> {
+    let Some(manifest) = latest() else {
+        bail!("could not reach the release feed");
+    };
+
+    if is_newer(&manifest.version, VERSION) {
+        println!(
+            "ReviewPad {} is available (running {VERSION})",
+            manifest.version
+        );
+        println!("{}", manifest.notes);
+        println!("Install it with: {}", Install::detect().upgrade_hint());
+    } else {
+        println!("ReviewPad {VERSION} is up to date");
+    }
+    Ok(())
+}
+
+/// Download the newest release and swap it in over the running executable.
+pub fn install() -> Result<()> {
+    let install = Install::detect();
+    if install == Install::Homebrew {
+        bail!(
+            "this copy is managed by Homebrew — run `{}` instead",
+            install.upgrade_hint()
+        );
+    }
+
+    let manifest = fetch_manifest()?;
+    if !is_newer(&manifest.version, VERSION) {
+        println!("ReviewPad {VERSION} is already up to date");
+        return Ok(());
+    }
+
+    let current = env::current_exe().context("could not locate the running binary")?;
+    let directory = current
+        .parent()
+        .context("the running binary has no parent directory")?;
+
+    println!("Downloading ReviewPad {}…", manifest.version);
+    let archive = download(&manifest.cli.url)?;
+    verify(&archive, &manifest.cli.sha256)?;
+
+    // Stage everything beside the target so the final swap is a rename on the
+    // same filesystem, which cannot leave a half-written binary behind.
+    let staging = directory.join(format!(".reviewpad-update-{}", std::process::id()));
+    fs::create_dir_all(&staging).with_context(|| {
+        format!(
+            "could not write to {} — reinstall with `brew upgrade --cask reviewpad` \
+             or re-run with write access",
+            directory.display()
+        )
+    })?;
+    let result = swap(&archive, &staging, &current);
+    let _ = fs::remove_dir_all(&staging);
+    result?;
+
+    println!("Updated to ReviewPad {}", manifest.version);
+    println!("{}", manifest.notes);
+    Ok(())
+}
+
+fn download(url: &str) -> Result<Vec<u8>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(300)))
+        .user_agent(concat!("reviewpad/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .new_agent();
+
+    let mut response = agent
+        .get(url)
+        .call()
+        .with_context(|| format!("could not download {url}"))?;
+
+    let body = response
+        .body_mut()
+        .with_config()
+        // Releases are a few tens of megabytes; the cap is a sanity bound, not
+        // a tuning knob.
+        .limit(256 * 1024 * 1024)
+        .read_to_vec()
+        .context("the download was interrupted")?;
+
+    Ok(body)
+}
+
+fn verify(bytes: &[u8], expected: &str) -> Result<()> {
+    let actual = hex(&Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("checksum mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Unpack the archive and move the new binary into place, keeping the old one
+/// until the rename succeeds.
+fn swap(archive: &[u8], staging: &Path, current: &Path) -> Result<()> {
+    let tarball = staging.join("reviewpad.tar.gz");
+    fs::write(&tarball, archive).context("could not stage the download")?;
+
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(staging)
+        .status()
+        .context("could not run tar")?;
+    if !status.success() {
+        bail!("could not unpack the release archive");
+    }
+
+    let replacement = staging.join("reviewpad");
+    if !replacement.is_file() {
+        bail!("the release archive did not contain a reviewpad binary");
+    }
+    fs::set_permissions(&replacement, permissions(0o755))?;
+
+    // A running executable cannot be overwritten in place, but it can be
+    // renamed out of the way — open file handles follow the inode.
+    let retired = staging.join("reviewpad.old");
+    fs::rename(current, &retired).context("could not move the current binary aside")?;
+    if let Err(error) = fs::rename(&replacement, current) {
+        // Put the old binary back rather than leaving nothing installed.
+        let _ = fs::rename(&retired, current);
+        return Err(error).context("could not install the new binary");
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn permissions(mode: u32) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(mode)
+}
+
+#[cfg(not(unix))]
+fn permissions(_mode: u32) -> fs::Permissions {
+    unreachable!("ReviewPad only ships on macOS and Linux")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newer_versions_compare_numerically() {
+        assert!(is_newer("0.10.0", "0.9.0"));
+        assert!(is_newer("1.0.0", "0.99.99"));
+        assert!(is_newer("0.1.1", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn tags_and_prereleases_are_normalized() {
+        assert!(is_newer("v0.2.0", "0.1.0"));
+        assert!(!is_newer("0.1.0-rc.1", "0.1.0"));
+        assert!(is_newer("0.2.0-rc.1", "0.1.0"));
+    }
+
+    #[test]
+    fn shorter_versions_pad_with_zeros() {
+        assert!(is_newer("0.2", "0.1.9"));
+        assert!(!is_newer("0.1", "0.1.0"));
+    }
+
+    #[test]
+    fn homebrew_paths_are_recognized() {
+        assert_eq!(
+            Install::for_path(Path::new(
+                "/opt/homebrew/Caskroom/reviewpad/0.1.0/reviewpad"
+            )),
+            Install::Homebrew
+        );
+        assert_eq!(
+            Install::for_path(Path::new("/usr/local/Cellar/reviewpad/0.1.0/bin/reviewpad")),
+            Install::Homebrew
+        );
+        assert_eq!(
+            Install::for_path(Path::new("/Users/me/.cargo/bin/reviewpad")),
+            Install::Standalone
+        );
+    }
+}

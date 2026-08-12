@@ -7,7 +7,37 @@ ReviewPad is a local-first Git review tool with one Rust binary and two interfac
 
 It reads staged, unstaged, and untracked changes. Comments are anchored to old or new line numbers and stored under `.git/reviewpad/comments.json`, so they do not dirty the working tree.
 
-## Build
+## Install
+
+```sh
+brew install --cask shkumbinhasani/tap/reviewpad
+```
+
+That puts `ReviewPad.app` in `/Applications` and `reviewpad` on your `PATH`. The
+build is a universal binary, ad-hoc signed and unnotarized, so the cask strips
+the quarantine flag on your behalf.
+
+You can also grab `ReviewPad-macos-universal.zip` or the bare
+`reviewpad-macos-universal.tar.gz` from the
+[latest release](https://github.com/shkumbinhasani/reviewpad/releases/latest);
+`SHA256SUMS` is published alongside them.
+
+### Updates
+
+ReviewPad checks for a newer release when it opens and shows an unobtrusive
+notice in the sidebar — the check is advisory and never blocks a review.
+
+```sh
+reviewpad update --check   # report what is available
+reviewpad update           # download, verify and install it
+```
+
+`reviewpad update` verifies the download against the SHA-256 in the release
+manifest and swaps the binary in atomically. Homebrew installs are left alone
+on purpose — rewriting a file Homebrew tracks would desynchronize its manifest,
+so those are pointed at `brew upgrade --cask reviewpad` instead.
+
+## Build from source
 
 GPUI currently supports macOS and Linux. On macOS, install Xcode and its optional Metal Toolchain, then run:
 
@@ -20,9 +50,9 @@ cargo install --path .
 To create a Finder-launchable macOS bundle (which opens a native repository picker):
 
 ```sh
-chmod +x scripts/bundle-macos.sh packaging/macos/reviewpad-launcher
-./scripts/bundle-macos.sh
-open target/release/ReviewPad.app
+./scripts/bundle-macos.sh          # host architecture
+UNIVERSAL=1 ./scripts/bundle-macos.sh   # arm64 + x86_64, as released
+open dist/ReviewPad.app
 ```
 
 ## Use it as a desktop app
@@ -70,6 +100,32 @@ reviewpad clear .    # remove all saved comments
 ## Development
 
 ```sh
-cargo fmt --check
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+```
+
+CI runs all three on every push and pull request, and separately proves the
+`.app` bundle still builds.
+
+## Releasing
+
+The tag is the source of truth for the version, and the release job refuses to
+publish if `Cargo.toml` disagrees with it.
+
+```sh
+# bump `version` in Cargo.toml first, then:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+That builds a universal binary, bundles and ad-hoc signs `ReviewPad.app`,
+publishes the archives with `SHA256SUMS` and the `latest.json` update manifest,
+and pushes the new version to the Homebrew cask.
+
+The cask step needs a `TAP_TOKEN` secret — a PAT with `contents: write` on
+`shkumbinhasani/homebrew-tap`, since the built-in `GITHUB_TOKEN` cannot push to
+another repository:
+
+```sh
+gh secret set TAP_TOKEN -R shkumbinhasani/reviewpad
 ```

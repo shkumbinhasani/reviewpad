@@ -11,6 +11,7 @@ use reviewpad::{
     git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
     review::{Review, ReviewComment},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
+    update,
 };
 
 // ReviewPad shares tgip's window language: a transparent, blurred window whose
@@ -192,8 +193,11 @@ fn open_review_window(
                 status: None,
                 syntax: SyntaxIndex::new(),
                 highlight: DiffHighlight::default(),
+                update: None,
+                update_task: None,
             };
             view.refresh_highlight();
+            view.check_for_update(cx);
             view
         });
         window.focus(&view.read(cx).focus);
@@ -215,6 +219,10 @@ struct ReviewView {
     status: Option<String>,
     syntax: SyntaxIndex,
     highlight: DiffHighlight,
+    /// Version of a newer release, once the background check has answered.
+    update: Option<String>,
+    /// Held so the check is cancelled if the window closes first.
+    update_task: Option<gpui::Task<()>>,
 }
 
 impl Focusable for ReviewView {
@@ -230,6 +238,24 @@ impl ReviewView {
         self.draft.clear();
         self.refresh_highlight();
         cx.notify();
+    }
+
+    /// Ask the release feed whether something newer exists. The request runs on
+    /// a background thread and the answer is advisory — a failed check leaves
+    /// the UI exactly as it was rather than interrupting a review.
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        self.update_task = Some(cx.spawn(async move |view, cx| {
+            let Some(manifest) = cx.background_spawn(async { update::latest() }).await else {
+                return;
+            };
+            if !update::is_newer(&manifest.version, update::VERSION) {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                view.update = Some(manifest.version);
+                cx.notify();
+            });
+        }));
     }
 
     /// Reparse the selected file so its hunks can be painted with real syntax
@@ -369,6 +395,15 @@ impl ReviewView {
         self.draft.clear();
         self.anchor = None;
         self.status = None;
+        cx.notify();
+    }
+
+    /// Put the upgrade command on the clipboard — the app never rewrites itself
+    /// out from under a review, and a Homebrew copy must not be touched at all.
+    fn copy_update_command(&mut self, cx: &mut Context<Self>) {
+        let command = update::Install::detect().upgrade_hint();
+        cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+        self.status = Some(format!("Copied `{command}`"));
         cx.notify();
     }
 
@@ -1149,6 +1184,41 @@ impl Render for ReviewView {
                     .pb(px(6.))
                     .children(file_groups),
             )
+            .when_some(self.update.clone(), |element, version| {
+                let command = update::Install::detect().upgrade_hint();
+                element.child(
+                    div()
+                        .id("update-banner")
+                        .mx(px(8.))
+                        .mb(px(2.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .rounded(px(8.))
+                        .bg(hex(ACCENT_FILL))
+                        .border_1()
+                        .border_color(tint(ACCENT, 0.22))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(tint(0x6b3f14, 0.92)))
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_update_command(cx)))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(ACCENT))
+                                .child(format!("ReviewPad {version} available")),
+                        )
+                        .child(
+                            div()
+                                .font_family(MONO)
+                                .text_size(px(10.))
+                                .text_color(fg(0.45))
+                                .child(command),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_none()

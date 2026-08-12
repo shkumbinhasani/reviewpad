@@ -1,0 +1,65 @@
+name: Update Homebrew cask
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  cask:
+    runs-on: ubuntu-latest
+    steps:
+      # A PAT with `contents: write` on the tap: the built-in GITHUB_TOKEN is
+      # scoped to this repository and cannot push to another one.
+      - name: Push the new version to the tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "TAP_TOKEN is not set — skipping the cask update." >&2
+            echo "Set it with: gh secret set TAP_TOKEN -R ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
+
+          VERSION=${TAG#v}
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ReviewPad-macos-universal.zip"
+          SHA256=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
+
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/shkumbinhasani/homebrew-tap.git" /tmp/tap
+          mkdir -p /tmp/tap/Casks
+
+          cat > /tmp/tap/Casks/reviewpad.rb <<CASK
+          cask "reviewpad" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/shkumbinhasani/reviewpad/releases/download/v#{version}/ReviewPad-macos-universal.zip"
+            name "ReviewPad"
+            desc "Local-first Git review app built on GPUI"
+            homepage "https://github.com/shkumbinhasani/reviewpad"
+
+            depends_on macos: ">= :monterey"
+
+            app "ReviewPad.app"
+            binary "#{appdir}/ReviewPad.app/Contents/MacOS/reviewpad"
+
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args: ["-cr", "#{appdir}/ReviewPad.app"],
+                             sudo: false
+            end
+
+            zap trash: [
+              "~/Library/Caches/dev.reviewpad.ReviewPad",
+              "~/Library/Saved Application State/dev.reviewpad.ReviewPad.savedState",
+            ]
+          end
+          CASK
+
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/reviewpad.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "reviewpad ${VERSION}"
+          git push
