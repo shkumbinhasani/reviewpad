@@ -48,6 +48,9 @@ const CASK_RECEIPTS: [&str; 2] = [
     "/usr/local/Caskroom/reviewpad",
 ];
 
+/// The shims a cask's `binary` stanza links into, under either prefix.
+const BREW_SHIMS: [&str; 2] = ["/opt/homebrew/bin/reviewpad", "/usr/local/bin/reviewpad"];
+
 impl Install {
     pub fn detect() -> Self {
         let Ok(path) = env::current_exe() else {
@@ -56,21 +59,31 @@ impl Install {
         let has_receipt = CASK_RECEIPTS
             .iter()
             .any(|receipt| Path::new(receipt).exists());
-        Self::classify(&path, has_receipt)
+
+        // `current_exe` reports the shim when ReviewPad is invoked through the
+        // symlink on PATH and the bundle when it is invoked directly, so both
+        // spellings have to be classified.
+        if Self::classify(&path, has_receipt) == Install::Homebrew {
+            return Install::Homebrew;
+        }
+        let resolved = fs::canonicalize(&path).unwrap_or(path);
+        Self::classify(&resolved, has_receipt)
     }
 
     /// A formula keeps its binary under `Cellar`, but a cask *moves* the bundle
-    /// into `/Applications` and links the executable out of it — and
-    /// `current_exe` resolves that symlink, so the running path carries no
-    /// Homebrew marker at all. The Caskroom receipt is what proves ownership
-    /// there; without this, `reviewpad update` would happily overwrite a bundle
-    /// Homebrew is tracking.
+    /// into `/Applications` and links the executable out of it, so the running
+    /// path carries no Homebrew marker at all. The Caskroom receipt is what
+    /// proves ownership there; without it, `reviewpad update` would overwrite a
+    /// bundle Homebrew tracks — which desynchronizes its manifest and leaves
+    /// `brew upgrade` unable to complete.
     fn classify(path: &Path, has_cask_receipt: bool) -> Self {
         let text = path.to_string_lossy();
         if text.contains("/Caskroom/") || text.contains("/Cellar/") {
             return Install::Homebrew;
         }
-        if has_cask_receipt && text.contains("/ReviewPad.app/") {
+        if has_cask_receipt
+            && (text.contains("/ReviewPad.app/") || BREW_SHIMS.contains(&text.as_ref()))
+        {
             return Install::Homebrew;
         }
         Install::Standalone
@@ -340,5 +353,19 @@ mod tests {
         assert_eq!(Install::classify(linked, true), Install::Homebrew);
         // The same bundle dragged in by hand is the user's to replace.
         assert_eq!(Install::classify(linked, false), Install::Standalone);
+    }
+
+    /// Run from PATH, `current_exe` reports the shim rather than the bundle it
+    /// points at, so the shim itself has to be recognized.
+    #[test]
+    fn the_brew_shim_is_homebrew_owned() {
+        let shim = Path::new("/opt/homebrew/bin/reviewpad");
+        assert_eq!(Install::classify(shim, true), Install::Homebrew);
+        assert_eq!(Install::classify(shim, false), Install::Standalone);
+        // A neighbouring binary is not the shim.
+        assert_eq!(
+            Install::classify(Path::new("/opt/homebrew/bin/reviewpad-dev"), true),
+            Install::Standalone
+        );
     }
 }
