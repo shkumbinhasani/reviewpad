@@ -24,8 +24,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install the Metal toolchain
-        run: xcodebuild -downloadComponent metalToolchain
+      # GPUI compiles its Metal shaders at build time with `xcrun metal`. Xcode
+      # 16.3+ moved that into a separately downloaded component; older Xcodes
+      # ship it in the toolchain and reject the download flag outright.
+      - name: Ensure the Metal toolchain is available
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "metal is already in the selected toolchain"
+          else
+            xcodebuild -downloadComponent metalToolchain
+          fi
 
       - name: Read the version from the tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
