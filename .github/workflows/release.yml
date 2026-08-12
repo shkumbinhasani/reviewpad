@@ -101,3 +101,14 @@ jobs:
             dist/latest.json
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Chained rather than triggered by `release: published`: GitHub suppresses
+  # workflow runs for events raised with GITHUB_TOKEN, so an event-driven cask
+  # update would never fire. Prereleases are left off the stable tap.
+  cask:
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/update-cask.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

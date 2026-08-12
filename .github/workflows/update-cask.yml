@@ -1,8 +1,21 @@
 name: Update Homebrew cask
 
+# Called by the release workflow rather than triggered by `release: published`.
+# A release created with GITHUB_TOKEN deliberately does not start new workflow
+# runs, so an event-driven cask update would silently never fire.
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish to the tap
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish to the tap (e.g. v0.1.0)
+        required: true
+        type: string
 
 jobs:
   cask:
@@ -15,7 +28,7 @@ jobs:
       - name: Push the new version to the tap
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
