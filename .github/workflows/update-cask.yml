@@ -63,7 +63,7 @@ jobs:
             desc "Local-first Git review app built on GPUI"
             homepage "https://github.com/shkumbinhasani/reviewpad"
 
-            depends_on macos: ">= :monterey"
+            depends_on macos: :monterey
 
             app "ReviewPad.app"
             binary "#{appdir}/ReviewPad.app/Contents/MacOS/reviewpad"
