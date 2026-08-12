@@ -122,10 +122,8 @@ That builds a universal binary, bundles and ad-hoc signs `ReviewPad.app`,
 publishes the archives with `SHA256SUMS` and the `latest.json` update manifest,
 and pushes the new version to the Homebrew cask.
 
-The cask step needs a `TAP_TOKEN` secret — a PAT with `contents: write` on
-`shkumbinhasani/homebrew-tap`, since the built-in `GITHUB_TOKEN` cannot push to
-another repository:
-
-```sh
-gh secret set TAP_TOKEN -R shkumbinhasani/reviewpad
-```
+The cask step authenticates with `TAP_DEPLOY_KEY`, the private half of a write
+deploy key on `shkumbinhasani/homebrew-tap`. The built-in `GITHUB_TOKEN` is
+scoped to this repository and cannot push to another one; a deploy key is
+narrower than a personal token, since it reaches exactly one repository and can
+be revoked on its own.
