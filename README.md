@@ -1,5 +1,9 @@
 # ReviewPad
 
+[![CI](https://github.com/shkumbinhasani/reviewpad/actions/workflows/ci.yml/badge.svg)](https://github.com/shkumbinhasani/reviewpad/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/shkumbinhasani/reviewpad)](https://github.com/shkumbinhasani/reviewpad/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 ReviewPad is a local-first Git review tool with one Rust binary and two interfaces:
 
 - a GPU-rendered desktop review panel built with [GPUI](https://www.gpui.rs/), the UI framework created for Zed;
