@@ -42,21 +42,38 @@ pub enum Install {
     Standalone,
 }
 
+/// Where Homebrew records that it owns this cask, under either prefix.
+const CASK_RECEIPTS: [&str; 2] = [
+    "/opt/homebrew/Caskroom/reviewpad",
+    "/usr/local/Caskroom/reviewpad",
+];
+
 impl Install {
     pub fn detect() -> Self {
-        match env::current_exe() {
-            Ok(path) => Self::for_path(&path),
-            Err(_) => Install::Standalone,
-        }
+        let Ok(path) = env::current_exe() else {
+            return Install::Standalone;
+        };
+        let has_receipt = CASK_RECEIPTS
+            .iter()
+            .any(|receipt| Path::new(receipt).exists());
+        Self::classify(&path, has_receipt)
     }
 
-    fn for_path(path: &Path) -> Self {
-        let path = path.to_string_lossy();
-        if path.contains("/Caskroom/") || path.contains("/Cellar/") {
-            Install::Homebrew
-        } else {
-            Install::Standalone
+    /// A formula keeps its binary under `Cellar`, but a cask *moves* the bundle
+    /// into `/Applications` and links the executable out of it — and
+    /// `current_exe` resolves that symlink, so the running path carries no
+    /// Homebrew marker at all. The Caskroom receipt is what proves ownership
+    /// there; without this, `reviewpad update` would happily overwrite a bundle
+    /// Homebrew is tracking.
+    fn classify(path: &Path, has_cask_receipt: bool) -> Self {
+        let text = path.to_string_lossy();
+        if text.contains("/Caskroom/") || text.contains("/Cellar/") {
+            return Install::Homebrew;
         }
+        if has_cask_receipt && text.contains("/ReviewPad.app/") {
+            return Install::Homebrew;
+        }
+        Install::Standalone
     }
 
     pub fn upgrade_hint(self) -> &'static str {
@@ -295,18 +312,33 @@ mod tests {
     #[test]
     fn homebrew_paths_are_recognized() {
         assert_eq!(
-            Install::for_path(Path::new(
-                "/opt/homebrew/Caskroom/reviewpad/0.1.0/reviewpad"
-            )),
+            Install::classify(
+                Path::new("/opt/homebrew/Caskroom/reviewpad/0.1.0/reviewpad"),
+                true
+            ),
             Install::Homebrew
         );
         assert_eq!(
-            Install::for_path(Path::new("/usr/local/Cellar/reviewpad/0.1.0/bin/reviewpad")),
+            Install::classify(
+                Path::new("/usr/local/Cellar/reviewpad/0.1.0/bin/reviewpad"),
+                false
+            ),
             Install::Homebrew
         );
         assert_eq!(
-            Install::for_path(Path::new("/Users/me/.cargo/bin/reviewpad")),
+            Install::classify(Path::new("/Users/me/.cargo/bin/reviewpad"), false),
             Install::Standalone
         );
+    }
+
+    /// The case the first cut got wrong: a cask links its binary out of the
+    /// bundle in /Applications, so the resolved path looks like a manual
+    /// install until you notice the Caskroom receipt.
+    #[test]
+    fn a_cask_linked_bundle_is_homebrew_owned() {
+        let linked = Path::new("/Applications/ReviewPad.app/Contents/MacOS/reviewpad");
+        assert_eq!(Install::classify(linked, true), Install::Homebrew);
+        // The same bundle dragged in by hand is the user's to replace.
+        assert_eq!(Install::classify(linked, false), Install::Standalone);
     }
 }
