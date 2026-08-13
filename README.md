@@ -113,6 +113,12 @@ git log -1 --format=%B | reviewpad reply c1.1 --author claude
 reviewpad remove c1.2   # drop a single reply, or c1 for the whole thread
 ```
 
+Each author gets an avatar: known agents show their own mark in their brand
+color, anyone else gets a colored monogram from their name, and the local user's
+Gravatar is used when their Git email has one. Set `REVIEWPAD_NO_GRAVATAR` to
+skip that lookup — it is the only request ReviewPad makes that derives from your
+identity.
+
 `--side old` anchors to the line as it was before the change; the default is
 `new`. `--repo` points at another working tree, and `reviewpad list --json`
 prints the review file itself for a machine to parse.

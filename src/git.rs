@@ -109,6 +109,14 @@ impl Repository {
         self.git_dir.join("reviewpad").join("comments.json")
     }
 
+    /// The Git identity configured for this repository, used to look up the
+    /// local user's avatar.
+    pub fn user_email(&self) -> Option<String> {
+        let output = git_output(&self.root, &["config", "user.email"]).ok()?;
+        let email = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (output.status.success() && !email.is_empty()).then_some(email)
+    }
+
     /// The working-tree copy of a file — the "new" side of the diff, and what a
     /// syntax highlighter needs to make sense of a hunk.
     pub fn working_source(&self, path: &str) -> Option<String> {

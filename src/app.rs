@@ -3,11 +3,12 @@ use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, FocusHandle,
     Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton,
     PathPromptOptions, Render, SharedString, StatefulInteractiveElement, StyledText, Window,
-    WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
+    WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use std::ops::Range;
 
 use reviewpad::{
+    avatar,
     git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
     review::{Review, ReviewComment, thread_of},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
@@ -30,6 +31,8 @@ const TITLEBAR_INSET: f32 = 32.;
 const GUTTER: f32 = 44.;
 /// Width of the +/− column, tgip's marker column narrowed for the gutters.
 const MARKER: f32 = 24.;
+/// Edge of an author's avatar tile.
+const AVATAR: f32 = 24.;
 const TAB_WIDTH: usize = 4;
 
 /// Git accent — the gold tgip uses for branch glyphs and dirty badges.
@@ -51,7 +54,6 @@ const DEL_MARK: u32 = 0xff9499fa;
 const CONTEXT_BG: u32 = 0xffffff06;
 const CONTEXT_TEXT: u32 = 0xebebebe0;
 const NOTE_BG: u32 = 0x403314eb;
-const NOTE_TEXT: u32 = 0xffe699f5;
 /// Unhighlighted code — One Dark's default foreground, so syntax spans and the
 /// text around them belong to the same palette.
 const CODE_TEXT: u32 = 0xc8ccd4f5;
@@ -100,25 +102,68 @@ fn tint(value: u32, alpha: f32) -> Hsla {
     color
 }
 
+/// Brand marks, compiled into the binary. gpui resolves `svg()` paths through
+/// the app's asset source, and embedding keeps the `.app` bundle a single file.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let bytes: &'static [u8] = match path {
+            "icons/claude.svg" => include_bytes!("../assets/icons/claude.svg"),
+            "icons/openai.svg" => include_bytes!("../assets/icons/openai.svg"),
+            "icons/gemini.svg" => include_bytes!("../assets/icons/gemini.svg"),
+            "icons/copilot.svg" => include_bytes!("../assets/icons/copilot.svg"),
+            "icons/cursor.svg" => include_bytes!("../assets/icons/cursor.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(std::borrow::Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(vec![
+            "icons/claude.svg".into(),
+            "icons/openai.svg".into(),
+            "icons/gemini.svg".into(),
+            "icons/copilot.svg".into(),
+            "icons/cursor.svg".into(),
+        ])
+    }
+}
+
 #[derive(Clone)]
 struct Anchor {
     file: usize,
     line: usize,
 }
 
+/// One message to draw inside a thread — the root note or any of its replies.
+struct Message<'a> {
+    /// Stable element key, distinct across every message on screen.
+    key: usize,
+    /// Hover group of the thread this belongs to.
+    group: &'a str,
+    author: &'a str,
+    id: &'a str,
+    /// Anchor line, shown on the root only.
+    meta: Option<String>,
+    body: String,
+}
+
 pub fn run(repository: Repository, diff: DiffSet, print_on_finish: bool) -> Result<()> {
     let review = Review::open(&repository)?;
 
-    Application::new().run(move |cx: &mut App| {
-        open_review_window(cx, repository, diff, review, print_on_finish);
-    });
+    Application::new()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            open_review_window(cx, repository, diff, review, print_on_finish);
+        });
     Ok(())
 }
 
 /// Launch the desktop app without a terminal working directory and let the user
 /// choose a Git repository with the native directory picker.
 pub fn pick_and_run() -> Result<()> {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(Assets).run(|cx: &mut App| {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -197,11 +242,14 @@ fn open_review_window(
                 status: None,
                 syntax: SyntaxIndex::new(),
                 highlight: DiffHighlight::default(),
+                portrait: None,
+                _portrait_task: None,
                 update: None,
                 update_task: None,
             };
             view.refresh_highlight();
             view.check_for_update(cx);
+            view.load_portrait(cx);
             view
         });
         window.focus(&view.read(cx).focus);
@@ -226,6 +274,9 @@ struct ReviewView {
     status: Option<String>,
     syntax: SyntaxIndex,
     highlight: DiffHighlight,
+    /// The local user's Gravatar, once the background lookup has answered.
+    portrait: Option<std::sync::Arc<gpui::Image>>,
+    _portrait_task: Option<gpui::Task<()>>,
     /// Version of a newer release, once the background check has answered.
     update: Option<String>,
     /// Held so the check is cancelled if the window closes first.
@@ -246,6 +297,80 @@ impl ReviewView {
         self.draft.clear();
         self.refresh_highlight();
         cx.notify();
+    }
+
+    /// Look up the local user's Gravatar in the background. Everyone already
+    /// has a monogram, so this only ever upgrades what is on screen — a missing
+    /// account, a blocked network or an opt-out all just leave it alone.
+    fn load_portrait(&mut self, cx: &mut Context<Self>) {
+        let Some(email) = self.repository.user_email() else {
+            return;
+        };
+        self._portrait_task = Some(cx.spawn(async move |view, cx| {
+            let Some(bytes) = cx
+                .background_spawn(async move { avatar::fetch_gravatar(&email) })
+                .await
+            else {
+                return;
+            };
+            let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+            let _ = view.update(cx, |view, cx| {
+                view.portrait = Some(image);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// A comment author's chip: their mark on a brand-colored tile, or a
+    /// monogram, with the user's own portrait layered over it once one loads.
+    fn render_avatar(&self, author: &str) -> gpui::Div {
+        let identity = avatar::identity(author);
+        let portrait = (author == AUTHOR).then(|| self.portrait.clone()).flatten();
+        // gpui paints an SVG as a mask tinted with the *element's own* text
+        // color — it does not inherit one — so the ink is set on the mark
+        // itself rather than on the tile around it.
+        let ink = if identity.is_light() {
+            scrim(0.8)
+        } else {
+            fg(0.96)
+        };
+
+        div()
+            .flex_none()
+            .relative()
+            .size(px(AVATAR))
+            .rounded(px(6.))
+            .overflow_hidden()
+            .bg(tint(identity.color, 0.95))
+            .flex()
+            .items_center()
+            .justify_center()
+            .map(|element| match identity.icon {
+                Some(icon) => element.child(
+                    svg()
+                        .path(icon)
+                        .size(px(AVATAR - 9.))
+                        .flex_none()
+                        .text_color(ink),
+                ),
+                None => element.child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(AVATAR))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(ink)
+                        .child(identity.label.clone()),
+                ),
+            })
+            .when_some(portrait, |element, image| {
+                element.child(
+                    img(image)
+                        .absolute()
+                        .inset_0()
+                        .size(px(AVATAR))
+                        .rounded(px(6.)),
+                )
+            })
     }
 
     /// Ask the release feed whether something newer exists. The request runs on
@@ -614,6 +739,9 @@ impl ReviewView {
             .items_center()
             .gap(px(10.))
             .min_w_full()
+            .font_family(MONO)
+            .text_size(px(13.))
+            .line_height(px(22.))
             .px(px(14.))
             .py(px(1.))
             .bg(hex(background))
@@ -683,6 +811,9 @@ impl ReviewView {
             .flex()
             .items_center()
             .min_w_full()
+            .font_family(MONO)
+            .text_size(px(13.))
+            .line_height(px(22.))
             .bg(if selected {
                 hex(NOTE_BG)
             } else {
@@ -763,179 +894,191 @@ impl ReviewView {
             })
     }
 
-    /// A thread: the anchored note, then its replies, each labelled with the id
-    /// an agent would pass to `reviewpad reply`.
+    /// One message in a thread: who wrote it, its id, and the prose. Replies
+    /// reuse this so a thread reads as a conversation rather than a stack of
+    /// differently-shaped boxes.
+    fn render_message(&self, message: Message<'_>, cx: &mut Context<Self>) -> gpui::Div {
+        let Message {
+            key,
+            group,
+            author,
+            id,
+            meta,
+            body,
+        } = message;
+        let remove_id = id.to_string();
+        let reply_id = id.to_string();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(self.render_avatar(author))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg(0.88))
+                            .child(author.to_string()),
+                    )
+                    .when_some(meta, |element, meta| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(fg(0.4))
+                                .child(meta),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .bg(fg(0.07))
+                            .font_family(MONO)
+                            .text_size(px(10.))
+                            .text_color(fg(0.45))
+                            .child(id.to_string()),
+                    )
+                    .child(div().flex_1())
+                    // Actions stay out of the way until the thread is hovered,
+                    // so a diff full of notes is not also full of buttons.
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .text_size(px(11.))
+                            .opacity(0.)
+                            .group_hover(group.to_string(), |style| style.opacity(1.))
+                            .child(
+                                div()
+                                    .id(("reply-to", key))
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .text_color(fg(0.45))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(fg(0.08)).text_color(tint(ACCENT, 1.)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_reply(reply_id.clone(), window, cx)
+                                    }))
+                                    .child("Reply"),
+                            )
+                            .child(
+                                div()
+                                    .id(("remove-message", key))
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .text_color(fg(0.45))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(fg(0.08)).text_color(hex(DEL_MARK)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.delete_comment(remove_id.clone(), cx)
+                                    }))
+                                    .child("Remove"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .whitespace_normal()
+                    .text_size(px(13.))
+                    .line_height(px(19.))
+                    .text_color(fg(0.84))
+                    .child(body),
+            )
+    }
+
+    /// A thread: the anchored note and everything it started, indented to the
+    /// code column and railed in the git accent.
     fn render_inline_comment(
         &self,
         index: usize,
         comment: ReviewComment,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let id = comment.id.clone();
+        let group = format!("thread-{index}");
         let replies = comment
             .replies
             .iter()
             .enumerate()
             .map(|(position, reply)| {
-                let reply_id = reply.id.clone();
                 div()
-                    .id(("reply", index * 64 + position))
-                    .mt(px(8.))
-                    .pt(px(8.))
+                    .pt(px(9.))
+                    .mt(px(9.))
                     .border_t_1()
-                    .border_color(fg(0.08))
-                    .child(
-                        div()
-                            .mb(px(3.))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(11.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(fg(0.72))
-                                            .child(reply.author.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(MONO)
-                                            .text_size(px(10.))
-                                            .text_color(fg(0.34))
-                                            .child(reply.id.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(("remove-reply", index * 64 + position))
-                                    .px_2()
-                                    .text_color(fg(0.34))
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(hex(DEL_MARK)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_comment(reply_id.clone(), cx)
-                                    }))
-                                    .child("Remove"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .whitespace_normal()
-                            .text_color(fg(0.85))
-                            .child(reply.body.clone()),
-                    )
+                    .border_color(fg(0.07))
+                    .child(self.render_message(
+                        Message {
+                            key: index * 64 + position + 1,
+                            group: &group,
+                            author: &reply.author,
+                            id: &reply.id,
+                            meta: None,
+                            body: reply.body.clone(),
+                        },
+                        cx,
+                    ))
             })
             .collect::<Vec<_>>();
 
-        let remove_id = id.clone();
-        let reply_id = id.clone();
+        let root = self.render_message(
+            Message {
+                key: index * 64,
+                group: &group,
+                author: &comment.author,
+                id: &comment.id,
+                meta: Some(format!("line {} · {}", comment.line, comment.side.label())),
+                body: comment.body.clone(),
+            },
+            cx,
+        );
 
         div()
             .id(("inline-comment", index))
-            .pl(px(112.))
+            .group(group)
+            .pl(px(GUTTER * 2. + MARKER))
             .pr(px(18.))
-            .py(px(8.))
-            .bg(fg(0.03))
+            .py(px(6.))
+            .bg(fg(0.02))
             .child(
                 div()
-                    .p(px(12.))
+                    .px(px(13.))
+                    .py(px(11.))
                     .rounded(px(8.))
-                    .border_l_2()
-                    .border_color(rgb(ACCENT))
-                    .bg(hex(NOTE_BG))
-                    .child(
-                        div()
-                            .mb_2()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.))
-                            .text_size(px(11.))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(hex(NOTE_TEXT))
-                                            .child(format!(
-                                                "{} · line {} · {}",
-                                                comment.author,
-                                                comment.line,
-                                                comment.side.label()
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(MONO)
-                                            .text_size(px(10.))
-                                            .text_color(fg(0.4))
-                                            .child(comment.id.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .child(
-                                        div()
-                                            .id(("reply-to", index))
-                                            .px_2()
-                                            .text_color(fg(0.4))
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(rgb(ACCENT)))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.start_reply(reply_id.clone(), window, cx)
-                                            }))
-                                            .child("Reply"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("remove-inline", index))
-                                            .px_2()
-                                            .text_color(fg(0.4))
-                                            .cursor_pointer()
-                                            .hover(|style| style.text_color(hex(DEL_MARK)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.delete_comment(remove_id.clone(), cx)
-                                            }))
-                                            .child("Remove"),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .whitespace_normal()
-                            .text_color(fg(0.9))
-                            .child(comment.body),
-                    )
+                    .bg(fg(0.05))
+                    .child(root)
                     .children(replies),
             )
     }
 
+    /// The draft. Shaped like the thread it will join, so committing a comment
+    /// does not make the block jump.
     fn render_inline_composer(
         &self,
         line: Option<&DiffLine>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let replying = self.reply_to.is_some();
         let heading = match (&self.reply_to, line.and_then(DiffLine::anchor)) {
-            (Some(target), _) => format!("Reply to {target}"),
+            (Some(target), _) => format!("Replying to {target}"),
             (None, Some((side, number))) => {
-                format!("Comment on line {number} · {}", side.label())
+                format!("New comment · line {number} · {}", side.label())
             }
-            (None, None) => "New review comment".to_string(),
+            (None, None) => "New comment".to_string(),
         };
-        let placeholder = if self.reply_to.is_some() {
+        let placeholder = if replying {
             "Write a reply…"
         } else {
             "Write a review comment…"
@@ -948,37 +1091,42 @@ impl ReviewView {
 
         div()
             .id("composer")
-            .pl(px(112.))
+            .pl(px(GUTTER * 2. + MARKER))
             .pr(px(18.))
-            .py(px(10.))
-            .bg(fg(0.03))
+            // A reply tucks under the thread it answers; a new comment stands
+            // on its own beneath the line.
+            .pt(px(if replying { 0. } else { 6. }))
+            .pb(px(8.))
+            .bg(fg(0.02))
             .child(
                 div()
-                    .p(px(12.))
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(tint(ACCENT, 0.3))
-                    .bg(hex(NOTE_BG))
+                    .px(px(13.))
+                    .py(px(11.))
+                    .rounded(px(8.))
+                    .bg(fg(0.06))
                     .child(
                         div()
-                            .mb_2()
+                            .mb(px(8.))
                             .flex()
                             .items_center()
                             .justify_between()
-                            .text_size(px(11.))
                             .child(
                                 div()
-                                    .text_color(hex(NOTE_TEXT))
+                                    .text_size(px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tint(ACCENT, 0.92))
                                     .child(heading),
                             )
                             .child(
                                 div()
                                     .id("cancel-inline")
-                                    .px_2()
-                                    .text_color(fg(0.4))
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .text_size(px(11.))
+                                    .text_color(fg(0.45))
                                     .cursor_pointer()
-                                    .hover(|style| style.text_color(fg(0.85)))
+                                    .hover(|style| style.bg(fg(0.08)).text_color(fg(0.9)))
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_comment(cx)))
                                     .child("Cancel"),
                             ),
@@ -986,32 +1134,40 @@ impl ReviewView {
                     .child(
                         div()
                             .id("inline-editor")
-                            .min_h(px(62.))
-                            .p(px(10.))
-                            .rounded(px(8.))
+                            .min_h(px(56.))
+                            .px(px(11.))
+                            .py(px(9.))
+                            .rounded(px(6.))
                             .border_1()
                             .border_color(fg(0.1))
-                            .bg(scrim(0.32))
+                            .bg(scrim(0.28))
                             .whitespace_normal()
-                            .text_color(fg(if self.draft.is_empty() { 0.4 } else { 0.92 }))
+                            .text_size(px(13.))
+                            .line_height(px(19.))
+                            .text_color(fg(if self.draft.is_empty() { 0.38 } else { 0.92 }))
                             .cursor_text()
                             .child(draft),
                     )
                     .child(
                         div()
-                            .mt_2()
+                            .mt(px(8.))
                             .flex()
                             .items_center()
                             .justify_between()
+                            .child(div().text_size(px(11.)).text_color(fg(0.35)).child(
+                                if replying {
+                                    "⌘↵ reply · Esc cancel"
+                                } else {
+                                    "⌘↵ add comment · Esc cancel"
+                                },
+                            ))
                             .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(fg(0.4))
-                                    .child("⌘↵ add comment · Esc cancel"),
-                            )
-                            .child(
-                                Self::button("add-inline", "Add comment", true)
-                                    .on_click(cx.listener(|this, _, _, cx| this.add_comment(cx))),
+                                Self::button(
+                                    "add-inline",
+                                    if replying { "Reply" } else { "Add comment" },
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.add_comment(cx))),
                             ),
                     ),
             )
@@ -1497,9 +1653,6 @@ impl Render for ReviewView {
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
-                    .font_family(MONO)
-                    .text_size(px(13.))
-                    .line_height(px(22.))
                     .children(diff_rows)
                     .when(self.diff.files.is_empty(), |element| {
                         element.child(Self::empty_state(

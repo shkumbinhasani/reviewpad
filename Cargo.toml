@@ -1,6 +1,6 @@
 [package]
 name = "reviewpad"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "A local-first GPUI code review app and agent-friendly CLI"
 license = "MIT"
@@ -30,7 +30,11 @@ tree-sitter-typescript = "0.23.2"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls", "json", "gzip"] }
 
 [dev-dependencies]
+# Rasterizing the app icon (examples/icon.rs). Same renderer gpui uses for SVGs.
+resvg = "0.45"
 tempfile = "3.20"
+tiny-skia = "0.11"
+usvg = "0.45"
 
 [profile.release]
 lto = "thin"

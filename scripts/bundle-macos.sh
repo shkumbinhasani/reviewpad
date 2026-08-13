@@ -27,8 +27,13 @@ else
     cp "target/release/reviewpad" "$DIST/reviewpad"
 fi
 
+# Rebuild the icon from its source SVG so the bundle can never ship a stale one.
+cargo run --quiet --example icon
+iconutil -c icns "$PROJECT_DIR/assets/ReviewPad.iconset" -o "$PROJECT_DIR/assets/ReviewPad.icns"
+
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS"
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+cp "$PROJECT_DIR/assets/ReviewPad.icns" "$BUNDLE/Contents/Resources/ReviewPad.icns"
 
 cp "$DIST/reviewpad" "$BUNDLE/Contents/MacOS/reviewpad"
 cp "packaging/macos/reviewpad-launcher" "$BUNDLE/Contents/MacOS/reviewpad-launcher"

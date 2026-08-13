@@ -8,6 +8,8 @@
     <string>ReviewPad</string>
     <key>CFBundleExecutable</key>
     <string>reviewpad-launcher</string>
+    <key>CFBundleIconFile</key>
+    <string>ReviewPad</string>
     <key>CFBundleIdentifier</key>
     <string>dev.reviewpad.ReviewPad</string>
     <key>CFBundleInfoDictionaryVersion</key>

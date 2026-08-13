@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>ReviewPad</title>
+  <!--
+    A diff with a note left on it. The body follows macOS's icon grid: an
+    824pt rounded square centred on the 1024pt canvas, so it sits at the same
+    optical size as the system icons beside it in the Dock.
+
+    Colors are the app's own — tgip's dark glass, the diff greens and reds from
+    the hunk palette, and the git gold used for review notes.
+  -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2C2C36"/>
+      <stop offset="1" stop-color="#121217"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+  <rect x="106" y="106" width="812" height="812" rx="179" fill="none"
+        stroke="#ffffff" stroke-opacity="0.10" stroke-width="10"/>
+
+  <!-- Diff rows: context, an addition, a deletion, context. -->
+  <rect x="250" y="298" width="330" height="56" rx="28" fill="#8A94A6" fill-opacity="0.65"/>
+  <rect x="250" y="402" width="470" height="56" rx="28" fill="#7AFAA6"/>
+  <rect x="250" y="506" width="272" height="56" rx="28" fill="#FF9499"/>
+  <rect x="250" y="610" width="360" height="56" rx="28" fill="#8A94A6" fill-opacity="0.45"/>
+
+  <!--
+    The note. Stroked in the body color first so it reads as sitting above the
+    diff rather than merging into the rows it overlaps.
+  -->
+  <g>
+    <path d="M 550 516 H 802 A 60 60 0 0 1 862 576 V 684 A 60 60 0 0 1 802 744
+             H 664 L 542 848 L 604 744 H 550 A 60 60 0 0 1 490 684
+             V 576 A 60 60 0 0 1 550 516 Z"
+          fill="#16161C" stroke="#16161C" stroke-width="52" stroke-linejoin="round"/>
+    <path d="M 550 516 H 802 A 60 60 0 0 1 862 576 V 684 A 60 60 0 0 1 802 744
+             H 664 L 542 848 L 604 744 H 550 A 60 60 0 0 1 490 684
+             V 576 A 60 60 0 0 1 550 516 Z"
+          fill="#FFD173"/>
+    <rect x="548" y="576" width="256" height="34" rx="17" fill="#4A3208" fill-opacity="0.78"/>
+    <rect x="548" y="640" width="170" height="34" rx="17" fill="#4A3208" fill-opacity="0.55"/>
+  </g>
+</svg>
