@@ -37,6 +37,98 @@ pub struct Reply {
     pub body: String,
 }
 
+/// A place on an image or a video frame, normalized to 0..1 so it survives the
+/// image being displayed at any size.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Spot {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Spot {
+    /// How a person reads it and an agent can act on it.
+    pub fn label(&self) -> String {
+        format!("{:.0}%,{:.0}%", self.x * 100., self.y * 100.)
+    }
+}
+
+impl Eq for Spot {}
+
+/// What a comment is attached to. Code review anchors to a line; reviewing a
+/// render anchors to a moment or a place in it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Anchor {
+    /// A line in a text diff.
+    Line { side: Side, line: u32 },
+    /// A moment in a video. `frame` is carried when the frame rate was
+    /// readable, because a composition is written in frames, not seconds.
+    Time {
+        seconds: OrderedF64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spot: Option<Spot>,
+    },
+    /// A place on an image.
+    Spot { spot: Spot },
+}
+
+/// `f64` that can sit inside an `Eq` type. Times are only ever compared for
+/// identity here, never ordered by it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct OrderedF64(pub f64);
+
+impl Eq for OrderedF64 {}
+
+impl Anchor {
+    /// The anchor written the way it appears in the review and the CLI.
+    pub fn label(&self) -> String {
+        match self {
+            Anchor::Line { side, line } => format!("line {line} · {}", side.label()),
+            Anchor::Time {
+                seconds,
+                frame,
+                spot,
+            } => {
+                let mut label = crate::media::timecode(seconds.0);
+                if let Some(frame) = frame {
+                    label.push_str(&format!(" · frame {frame}"));
+                }
+                if let Some(spot) = spot {
+                    label.push_str(&format!(" · {}", spot.label()));
+                }
+                label
+            }
+            Anchor::Spot { spot } => spot.label(),
+        }
+    }
+
+    /// The line a text comment sits on, for the diff gutter.
+    pub fn line(&self) -> Option<(Side, u32)> {
+        match self {
+            Anchor::Line { side, line } => Some((*side, *line)),
+            _ => None,
+        }
+    }
+
+    pub fn seconds(&self) -> Option<f64> {
+        match self {
+            Anchor::Time { seconds, .. } => Some(seconds.0),
+            _ => None,
+        }
+    }
+
+    pub fn spot(&self) -> Option<Spot> {
+        match self {
+            Anchor::Spot { spot } => Some(*spot),
+            Anchor::Time { spot, .. } => *spot,
+            Anchor::Line { .. } => None,
+        }
+    }
+}
+
 /// A thread root: one note anchored to a line, plus whatever it started.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewComment {
@@ -45,8 +137,10 @@ pub struct ReviewComment {
     #[serde(default)]
     pub id: String,
     pub path: String,
-    pub side: Side,
-    pub line: u32,
+    /// What the note points at — a diff line, a moment in a video, a place on
+    /// an image. Reviews written before media support carried `side` and
+    /// `line`; `Review::load` folds those into an anchor.
+    pub anchor: Anchor,
     pub body: String,
     pub context: String,
     #[serde(default = "default_author")]
@@ -58,6 +152,33 @@ pub struct ReviewComment {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Review {
     pub comments: Vec<ReviewComment>,
+}
+
+/// Fold the pre-media `side`/`line` pair into an anchor, in the raw JSON so the
+/// struct itself carries no legacy fields.
+fn migrate_line_anchors(value: &mut serde_json::Value) {
+    let Some(comments) = value
+        .get_mut("comments")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for comment in comments {
+        let Some(comment) = comment.as_object_mut() else {
+            continue;
+        };
+        if comment.contains_key("anchor") {
+            continue;
+        }
+        let (Some(side), Some(line)) = (comment.remove("side"), comment.remove("line")) else {
+            continue;
+        };
+        comment.insert(
+            "anchor".into(),
+            serde_json::json!({ "kind": "line", "side": side, "line": line }),
+        );
+    }
 }
 
 /// The thread a comment or reply belongs to: `c3.2` lives in thread `c3`.
@@ -90,7 +211,10 @@ impl Review {
         }
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read review at {}", path.display()))?;
-        let mut review: Self = serde_json::from_slice(&bytes)
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse review at {}", path.display()))?;
+        migrate_line_anchors(&mut value);
+        let mut review: Self = serde_json::from_value(value)
             .with_context(|| format!("failed to parse review at {}", path.display()))?;
         review.assign_missing_ids();
         Ok(review)
@@ -115,12 +239,11 @@ impl Review {
             .with_context(|| format!("failed to save review at {}", path.display()))
     }
 
-    /// Open a thread on a line. Returns the new comment's id.
+    /// Open a thread wherever the anchor points. Returns the new comment's id.
     pub fn add_comment(
         &mut self,
         path: impl Into<String>,
-        side: Side,
-        line: u32,
+        anchor: Anchor,
         author: impl Into<String>,
         body: impl Into<String>,
         context: impl Into<String>,
@@ -129,8 +252,7 @@ impl Review {
         self.comments.push(ReviewComment {
             id: id.clone(),
             path: path.into(),
-            side,
-            line,
+            anchor,
             body: body.into(),
             context: context.into(),
             author: author.into(),
@@ -266,11 +388,10 @@ impl Review {
         output.push_str("Please address every item below. Preserve unrelated changes and run the relevant tests when finished.\n\n");
         for (index, comment) in self.comments.iter().enumerate() {
             output.push_str(&format!(
-                "## {}. `{}:{} ({})` — {}\n\n{}\n\n",
+                "## {}. `{}` — {} — {}\n\n{}\n\n",
                 index + 1,
                 comment.path,
-                comment.line,
-                comment.side.label(),
+                comment.anchor.label(),
                 comment.id,
                 comment.body.trim()
             ));
@@ -306,8 +427,10 @@ mod tests {
         let mut review = Review::default();
         review.add_comment(
             "src/lib.rs",
-            Side::New,
-            12,
+            Anchor::Line {
+                side: Side::New,
+                line: 12,
+            },
             "reviewer",
             "Handle the error instead of unwrapping.",
             "+let value = thing.unwrap();",
@@ -318,7 +441,8 @@ mod tests {
     #[test]
     fn markdown_is_agent_ready() {
         let text = review().markdown(Path::new("/tmp/project"));
-        assert!(text.contains("`src/lib.rs:12 (new)`"));
+        assert!(text.contains("`src/lib.rs`"));
+        assert!(text.contains("line 12 · new"));
         assert!(text.contains("Handle the error"));
         assert!(text.contains("```diff"));
         assert!(text.contains("c1"));
@@ -388,6 +512,85 @@ mod tests {
         assert_eq!(review.comments[1].id, "c2");
         assert_eq!(review.comments[0].author, DEFAULT_AUTHOR);
         assert!(review.comments[0].replies.is_empty());
+    }
+
+    /// Reviews written before media support anchored with a `side`/`line`
+    /// pair. They have to keep working, and come back as line anchors.
+    #[test]
+    fn a_review_written_before_media_migrates_to_anchors() {
+        let legacy = r#"{"comments":[
+            {"id":"c1","path":"a.rs","side":"new","line":7,"body":"one","context":"",
+             "author":"reviewer","replies":[]}
+        ]}"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comments.json");
+        fs::write(&path, legacy).unwrap();
+
+        let review = Review::load(&path).unwrap();
+        assert_eq!(
+            review.comments[0].anchor,
+            Anchor::Line {
+                side: Side::New,
+                line: 7
+            }
+        );
+        assert_eq!(review.comments[0].anchor.line(), Some((Side::New, 7)));
+    }
+
+    #[test]
+    fn media_anchors_read_the_way_an_agent_needs_them() {
+        let mut review = Review::default();
+        review.add_comment(
+            "out/video.mp4",
+            Anchor::Time {
+                seconds: OrderedF64(12.5),
+                frame: Some(375),
+                spot: Some(Spot { x: 0.42, y: 0.31 }),
+            },
+            "reviewer",
+            "The logo lands late.",
+            "",
+        );
+        review.add_comment(
+            "design/hero.png",
+            Anchor::Spot {
+                spot: Spot { x: 0.5, y: 0.2 },
+            },
+            "reviewer",
+            "Too much headroom.",
+            "",
+        );
+
+        let text = review.markdown(Path::new("/tmp/project"));
+        // The timecode a person reads and the frame a composition is written in.
+        assert!(text.contains("0:12.500"));
+        assert!(text.contains("frame 375"));
+        assert!(text.contains("42%,31%"));
+        assert!(text.contains("50%,20%"));
+        assert!(text.contains("out/video.mp4"));
+    }
+
+    #[test]
+    fn anchors_round_trip_through_json() {
+        let mut review = Review::default();
+        review.add_comment(
+            "out/video.mp4",
+            Anchor::Time {
+                seconds: OrderedF64(3.25),
+                frame: Some(97),
+                spot: None,
+            },
+            "agent",
+            "body",
+            "",
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comments.json");
+        review.save(&path).unwrap();
+
+        let reloaded = Review::load(&path).unwrap();
+        assert_eq!(reloaded.comments[0].anchor, review.comments[0].anchor);
+        assert_eq!(reloaded.comments[0].anchor.seconds(), Some(3.25));
     }
 
     #[test]

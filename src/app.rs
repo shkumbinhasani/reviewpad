@@ -1,17 +1,23 @@
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, FocusHandle,
-    Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement, StyledText,
-    Window, WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size, svg,
+    Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point,
+    Render, SharedString, StatefulInteractiveElement, StyledText, Window, WindowBounds,
+    WindowOptions, canvas, div, img, list, point, prelude::*, px, relative, rgb, rgba, size, svg,
+    uniform_list,
 };
-use std::ops::Range;
+use std::{ops::Range, path::PathBuf, time::Duration};
 
+use core_video::pixel_buffer::CVPixelBuffer;
+use gpui::surface;
 use reviewpad::{
     avatar,
     field::{self, FieldStyle, TextField},
     git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
-    review::{Review, ReviewComment, thread_of},
+    media::{self, Medium, Probe},
+    player::Player,
+    review::{Anchor, OrderedF64, Review, ReviewComment, Spot, thread_of},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
     update,
 };
@@ -34,6 +40,8 @@ const GUTTER: f32 = 44.;
 const MARKER: f32 = 24.;
 /// Edge of an author's avatar tile.
 const AVATAR: f32 = 24.;
+/// Height of a sidebar row. Fixed, so the list can virtualize.
+const SIDEBAR_ROW: f32 = 30.;
 const TAB_WIDTH: usize = 4;
 
 /// Git accent — the gold tgip uses for branch glyphs and dirty badges.
@@ -181,10 +189,37 @@ fn holds_the_mouse(element: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::D
     element.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
+/// The diff row the composer is aimed at: indices into the rendered file,
+/// not a review anchor.
 #[derive(Clone)]
-struct Anchor {
+struct Target {
     file: usize,
     line: usize,
+}
+
+/// One row of the diff, as a description rather than an element.
+///
+/// The pane used to build every row of the selected file each frame — 7,086 of
+/// them for a transcript in a real project. Planning them costs a vector of
+/// small enums; only the rows on screen are ever built.
+#[derive(Clone)]
+enum DiffRow {
+    /// A hunk header or a metadata line, drawn as a full-width band.
+    Band(usize),
+    /// A line of code.
+    Code(usize),
+    /// A thread hanging off the line above.
+    Thread(usize),
+    /// The composer, under whichever row it is answering.
+    Composer(usize),
+}
+
+/// One row of the sidebar. Flat and uniform so the list can skip straight to
+/// the rows on screen instead of building all of them.
+#[derive(Clone)]
+enum SidebarRow {
+    Folder(String),
+    File(usize),
 }
 
 /// One message to draw inside a thread — the root note or any of its replies.
@@ -306,12 +341,28 @@ fn open_review_window(
                 status: None,
                 syntax: SyntaxIndex::new(),
                 highlight: DiffHighlight::default(),
+                medium: Medium::Text,
+                probe: None,
+                time: 0.,
+                player: None,
+                frame: None,
+                _pump: None,
+                pending_spot: None,
+                media_bounds: None,
+                stage_bounds: None,
+                timeline_bounds: None,
+                sidebar_rows: Vec::new(),
+                diff_rows: Vec::new(),
+                diff_list: ListState::new(0, ListAlignment::Top, px(600.)),
                 portrait: None,
                 _portrait_task: None,
                 update: None,
                 update_task: None,
             };
+            view.plan_sidebar();
+            view.plan_diff();
             view.refresh_highlight();
+            view.refresh_medium(cx);
             view.check_for_update(cx);
             view.load_portrait(cx);
             view
@@ -328,7 +379,7 @@ struct ReviewView {
     diff: DiffSet,
     review: Review,
     selected_file: usize,
-    anchor: Option<Anchor>,
+    anchor: Option<Target>,
     /// Id of the thread the composer is answering, when it is not anchored to a
     /// diff line.
     reply_to: Option<String>,
@@ -340,6 +391,33 @@ struct ReviewView {
     status: Option<String>,
     syntax: SyntaxIndex,
     highlight: DiffHighlight,
+    /// What the selected file is, and where we are in it when it is a video.
+    medium: Medium,
+    probe: Option<Probe>,
+    /// Scrub position, in seconds.
+    time: f64,
+    /// The clip, decoded by AVFoundation. Frames arrive as buffers gpui binds
+    /// directly, so there is no cache and nothing on disk.
+    player: Option<Player>,
+    /// The most recent frame, held so the pane keeps drawing between frames.
+    frame: Option<CVPixelBuffer>,
+    /// Pulls frames and follows the player's clock.
+    _pump: Option<gpui::Task<()>>,
+    /// A place the pointer put down, waiting for the comment to be written.
+    pending_spot: Option<Spot>,
+    /// Painted bounds of the image and the scrubber, which is what turns a
+    /// click into a normalized spot or a time.
+    media_bounds: Option<Bounds<Pixels>>,
+    /// The area the media is drawn into, which the video rect is fitted inside.
+    stage_bounds: Option<Bounds<Pixels>>,
+    /// The sidebar's rows, rebuilt when the file list changes rather than on
+    /// every frame — a playing video repaints the window 15 to 60 times a
+    /// second, and this list runs to hundreds of rows in a real project.
+    sidebar_rows: Vec<SidebarRow>,
+    /// The selected file's rows, and the list that scrolls them.
+    diff_rows: Vec<DiffRow>,
+    diff_list: ListState,
+    timeline_bounds: Option<Bounds<Pixels>>,
     /// The local user's Gravatar, once the background lookup has answered.
     portrait: Option<std::sync::Arc<gpui::Image>>,
     _portrait_task: Option<gpui::Task<()>>,
@@ -362,6 +440,8 @@ impl ReviewView {
         self.reply_to = None;
         self.clear_draft(cx);
         self.refresh_highlight();
+        self.refresh_medium(cx);
+        self.plan_diff();
         cx.notify();
     }
 
@@ -457,6 +537,145 @@ impl ReviewView {
         }));
     }
 
+    /// Flatten the changed files into sidebar rows, grouped by directory.
+    fn plan_sidebar(&mut self) {
+        let mut rows = Vec::new();
+        let mut current: Option<&str> = None;
+
+        for (index, file) in self.diff.files.iter().enumerate() {
+            let parent = file.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if current != Some(parent) {
+                rows.push(SidebarRow::Folder(if parent.is_empty() {
+                    "./".to_string()
+                } else {
+                    format!("{parent}/")
+                }));
+                current = Some(parent);
+            }
+            rows.push(SidebarRow::File(index));
+        }
+
+        self.sidebar_rows = rows;
+    }
+
+    /// Work out what the selected file is and, for a video, how long it runs.
+    /// A rendered file reaches the sidebar like any other change; this decides
+    /// whether it is read as a diff or looked at.
+    fn refresh_medium(&mut self, cx: &mut Context<Self>) {
+        self.pending_spot = None;
+        self.time = 0.;
+        self.probe = None;
+        self.player = None;
+        self.frame = None;
+        self._pump = None;
+
+        let Some(file) = self.diff.files.get(self.selected_file) else {
+            self.medium = Medium::Text;
+            return;
+        };
+        self.medium = Medium::of(&file.path);
+        if self.medium != Medium::Video {
+            return;
+        }
+
+        let video = self.repository.root.join(&file.path);
+        match Player::open(&video) {
+            Ok(player) => {
+                self.player = Some(player);
+                self.start_pump(cx);
+            }
+            Err(error) => {
+                self.status = Some(format!("Could not open the clip: {error}"));
+            }
+        }
+    }
+
+    /// Follow the player: pull each new frame and read its clock.
+    ///
+    /// AVFoundation owns the timing, so this only asks what the current frame
+    /// and time are — it never advances anything itself. That is what keeps
+    /// picture, sound and the scrubber in agreement.
+    fn start_pump(&mut self, cx: &mut Context<Self>) {
+        let step = Duration::from_millis(8);
+        self._pump = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(step).await;
+                let alive = view.update(cx, |view, cx| {
+                    let Some(player) = view.player.as_mut() else {
+                        return false;
+                    };
+                    // Duration and frame rate only become readable once the
+                    // item has loaded, so they are picked up here.
+                    if view.probe.is_none() && player.is_ready() {
+                        let duration = player.duration();
+                        let fps = player.fps();
+                        if duration > 0. {
+                            view.probe = Some(Probe { duration, fps });
+                        }
+                    }
+
+                    let time = player.current_time();
+                    let frame = player.frame();
+                    let arrived = frame.is_some();
+                    let playing = player.is_playing();
+                    let finished = playing && player.is_finished();
+                    if finished {
+                        player.pause();
+                    }
+
+                    if arrived {
+                        view.frame = frame;
+                    }
+                    // Only follow the clock while it is running; otherwise the
+                    // scrub position is ours to set.
+                    if playing {
+                        view.time = time;
+                    }
+                    if arrived || playing || finished {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Move to a moment. The player seeks precisely, so the frame that appears
+    /// is the frame the comment will name.
+    fn seek(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        let duration = self.probe.map(|probe| probe.duration).unwrap_or(0.);
+        self.time = seconds.clamp(0., duration);
+        if let Some(player) = self.player.as_ref() {
+            player.seek(self.time);
+        }
+        cx.notify();
+    }
+
+    fn is_playing(&self) -> bool {
+        self.player
+            .as_ref()
+            .is_some_and(|player| player.is_playing())
+    }
+
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self.player.as_ref() else {
+            return;
+        };
+        if player.is_playing() {
+            player.pause();
+        } else {
+            // Replay from the start once it has run out.
+            if player.is_finished() {
+                player.seek(0.);
+            }
+            player.play();
+        }
+        cx.notify();
+    }
+
     /// Reparse the selected file so its hunks can be painted with real syntax
     /// colors. Only the file on screen is parsed, and only when it changes.
     fn refresh_highlight(&mut self) {
@@ -473,9 +692,10 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.anchor = Some(Anchor { file, line });
+        self.anchor = Some(Target { file, line });
         self.reply_to = None;
         self.status = None;
+        self.plan_diff();
         self.draft.update(cx, |draft, cx| {
             draft.set_placeholder("Write a review comment…", cx);
         });
@@ -510,6 +730,7 @@ impl ReviewView {
             "enter" if composing && (modifiers.platform || modifiers.control) => {
                 self.add_comment(cx)
             }
+            "space" if !composing && self.medium == Medium::Video => self.toggle_play(cx),
             "escape" => {
                 self.cancel_comment(cx);
                 self.reclaim_focus(window);
@@ -539,6 +760,27 @@ impl ReviewView {
             return;
         }
 
+        // A place on an image or a moment in a video, put down by pointer.
+        if let Some(spot) = self.pending_spot {
+            let Some(file) = self.diff.files.get(self.selected_file) else {
+                return;
+            };
+            let path = file.path.clone();
+            let anchor = match self.medium {
+                Medium::Video => Anchor::Time {
+                    seconds: OrderedF64(self.time),
+                    frame: self.probe.map(|probe| probe.frame_at(self.time)),
+                    spot: Some(spot),
+                },
+                _ => Anchor::Spot { spot },
+            };
+            self.review
+                .add_comment(path, anchor, AUTHOR, body, String::new());
+            self.pending_spot = None;
+            self.finish_composing("Comment saved", cx);
+            return;
+        }
+
         let Some(anchor) = self.anchor.clone() else {
             self.status = Some("Select a diff line first".into());
             cx.notify();
@@ -558,8 +800,13 @@ impl ReviewView {
 
         let context = file.context_at(anchor.line);
         let path = file.path.clone();
-        self.review
-            .add_comment(path, side, number, AUTHOR, body, context);
+        self.review.add_comment(
+            path,
+            Anchor::Line { side, line: number },
+            AUTHOR,
+            body,
+            context,
+        );
         self.finish_composing("Comment saved", cx);
     }
 
@@ -577,6 +824,7 @@ impl ReviewView {
             Ok(()) => Some(saved.into()),
             Err(error) => Some(format!("Could not save: {error}")),
         };
+        self.plan_diff();
         cx.notify();
     }
 
@@ -592,6 +840,7 @@ impl ReviewView {
             Ok(()) => Some("Comment removed".into()),
             Err(error) => Some(format!("Could not save: {error}")),
         };
+        self.plan_diff();
         cx.notify();
     }
 
@@ -601,6 +850,7 @@ impl ReviewView {
         self.anchor = None;
         self.clear_draft(cx);
         self.status = None;
+        self.plan_diff();
         self.draft.update(cx, |draft, cx| {
             draft.set_placeholder("Write a reply…", cx);
         });
@@ -612,7 +862,9 @@ impl ReviewView {
         self.clear_draft(cx);
         self.anchor = None;
         self.reply_to = None;
+        self.pending_spot = None;
         self.status = None;
+        self.plan_diff();
         cx.notify();
     }
 
@@ -722,6 +974,7 @@ impl ReviewView {
         };
 
         holds_the_mouse(div().id(("file", index)))
+            .w_full()
             .flex()
             .items_center()
             .gap(px(9.))
@@ -862,8 +1115,7 @@ impl ReviewView {
                 .iter()
                 .filter(|comment| {
                     self.diff.files[file_index].path == comment.path
-                        && comment.side == side
-                        && comment.line == number
+                        && comment.anchor.line() == Some((side, number))
                 })
                 .count()
         });
@@ -1105,7 +1357,7 @@ impl ReviewView {
                 group: &group,
                 author: &comment.author,
                 id: &comment.id,
-                meta: Some(format!("line {} · {}", comment.line, comment.side.label())),
+                meta: Some(comment.anchor.label()),
                 body: comment.body.clone(),
             },
             cx,
@@ -1145,7 +1397,15 @@ impl ReviewView {
             (None, Some((side, number))) => {
                 format!("New comment · line {number} · {}", side.label())
             }
-            (None, None) => "New comment".to_string(),
+            (None, None) => match (self.pending_spot, self.medium) {
+                (Some(spot), Medium::Video) => format!(
+                    "New comment · {} · {}",
+                    media::timecode(self.time),
+                    spot.label()
+                ),
+                (Some(spot), _) => format!("New comment · {}", spot.label()),
+                _ => "New comment".to_string(),
+            },
         };
 
         div()
@@ -1230,50 +1490,39 @@ impl ReviewView {
             )
     }
 
-    fn render_diff_rows(
-        &self,
-        file_index: usize,
-        file: &FileDiff,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    /// Work out which rows the selected file shows, without building any.
+    fn plan_diff(&mut self) {
         let mut rows = Vec::new();
-        let gutter = gutter_width(file);
+        let Some(file) = self.diff.files.get(self.selected_file) else {
+            self.diff_rows = rows;
+            self.diff_list = ListState::new(0, ListAlignment::Top, px(600.));
+            return;
+        };
 
-        for (line_index, line) in file.lines.iter().enumerate() {
+        for (index, line) in file.lines.iter().enumerate() {
             // The path and mode are already in the header, so the raw `---`,
             // `+++` and `index` lines are dropped rather than restyled.
             if line.kind == LineKind::Header && is_noise(&line.text) {
                 continue;
             }
-
             if matches!(line.kind, LineKind::Header | LineKind::Hunk) || line.text.starts_with('\\')
             {
-                rows.push(self.render_band(line_index, line).into_any_element());
+                rows.push(DiffRow::Band(index));
                 continue;
             }
 
-            rows.push(
-                self.render_line(file_index, line_index, line, gutter, cx)
-                    .into_any_element(),
-            );
+            rows.push(DiffRow::Code(index));
 
             if let Some((side, number)) = line.anchor() {
-                for (comment_index, comment) in self.review.comments.iter().enumerate() {
-                    if comment.path == file.path && comment.side == side && comment.line == number {
-                        let answering = self
+                for (position, comment) in self.review.comments.iter().enumerate() {
+                    if comment.path == file.path && comment.anchor.line() == Some((side, number)) {
+                        rows.push(DiffRow::Thread(position));
+                        if self
                             .reply_to
                             .as_deref()
-                            .is_some_and(|target| thread_of(target) == comment.id);
-                        rows.push(
-                            self.render_inline_comment(comment_index, comment.clone(), gutter, cx)
-                                .into_any_element(),
-                        );
-                        if answering {
-                            rows.push(
-                                self.render_inline_composer(Some(line), gutter, window, cx)
-                                    .into_any_element(),
-                            );
+                            .is_some_and(|target| thread_of(target) == comment.id)
+                        {
+                            rows.push(DiffRow::Composer(index));
                         }
                     }
                 }
@@ -1282,69 +1531,468 @@ impl ReviewView {
             if self
                 .anchor
                 .as_ref()
-                .is_some_and(|anchor| anchor.file == file_index && anchor.line == line_index)
+                .is_some_and(|anchor| anchor.file == self.selected_file && anchor.line == index)
             {
-                rows.push(
-                    self.render_inline_composer(Some(line), gutter, window, cx)
-                        .into_any_element(),
-                );
+                rows.push(DiffRow::Composer(index));
             }
         }
 
-        rows
+        self.diff_list = ListState::new(rows.len(), ListAlignment::Top, px(600.));
+        self.diff_rows = rows;
     }
 
-    /// The changed-file list, grouped by directory the way tgip nests terminal
-    /// tabs under their folder, with a rail standing in for its tree spine.
-    fn render_file_groups(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-        for (index, file) in self.diff.files.iter().enumerate() {
-            let parent = file.path.rsplit_once('/').map_or("", |(parent, _)| parent);
-            match groups.iter_mut().find(|(key, _)| *key == parent) {
-                Some((_, files)) => files.push(index),
-                None => groups.push((parent, vec![index])),
-            }
-        }
+    /// Build one planned row.
+    fn render_diff_row(&self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.diff_rows.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        let Some(file) = self.diff.files.get(self.selected_file) else {
+            return div().into_any_element();
+        };
+        let gutter = gutter_width(file);
 
-        groups
-            .into_iter()
-            .map(|(parent, files)| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .px(px(10.))
-                            .pt(px(8.))
-                            .pb(px(3.))
-                            .truncate()
-                            .font_family(MONO)
-                            .text_size(px(10.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(ink())
-                            .child(if parent.is_empty() {
-                                "./".to_string()
-                            } else {
-                                format!("{parent}/")
-                            }),
-                    )
-                    .child(
-                        div()
-                            .ml(px(9.))
-                            .pl(px(6.))
-                            .border_l_1()
-                            .border_color(fg(0.09))
-                            .flex()
-                            .flex_col()
-                            .children(
-                                files.into_iter().map(|index| {
-                                    self.render_file(index, &self.diff.files[index], cx)
-                                }),
-                            ),
-                    )
-                    .into_any_element()
+        match row {
+            DiffRow::Band(line) => match file.lines.get(line) {
+                Some(diff_line) => self.render_band(line, diff_line).into_any_element(),
+                None => div().into_any_element(),
+            },
+            DiffRow::Code(line) => match file.lines.get(line) {
+                Some(diff_line) => self
+                    .render_line(self.selected_file, line, diff_line, gutter, cx)
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            DiffRow::Thread(position) => match self.review.comments.get(position) {
+                Some(comment) => self
+                    .render_inline_comment(position, comment.clone(), gutter, cx)
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            DiffRow::Composer(line) => self
+                .render_inline_composer(file.lines.get(line), gutter, window, cx)
+                .into_any_element(),
+        }
+    }
+
+    /// One sidebar row: a directory heading, or a file under it.
+    ///
+    /// Rows are a fixed height so the list can place them without measuring —
+    /// the rail that stands in for tgip's tree spine is drawn by the file rows
+    /// themselves rather than by a container around them.
+    fn render_sidebar_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        match self.sidebar_rows.get(index) {
+            Some(SidebarRow::Folder(label)) => div()
+                .h(px(SIDEBAR_ROW))
+                .w_full()
+                .flex()
+                .items_center()
+                .px(px(10.))
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(MONO)
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ink())
+                        .child(label.clone()),
+                )
+                .into_any_element(),
+            Some(SidebarRow::File(file)) => {
+                let file = *file;
+                match self.diff.files.get(file) {
+                    Some(diff) => div()
+                        .h(px(SIDEBAR_ROW))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .ml(px(9.))
+                        .pl(px(6.))
+                        .pr(px(4.))
+                        .border_l_1()
+                        .border_color(fg(0.09))
+                        .child(self.render_file(file, diff, cx))
+                        .into_any_element(),
+                    None => div().h(px(SIDEBAR_ROW)).into_any_element(),
+                }
+            }
+            None => div().h(px(SIDEBAR_ROW)).into_any_element(),
+        }
+    }
+
+    /// Note whatever the pointer landed on, and open the composer for it. The
+    /// spot is normalized against the displayed size, so it stays correct at
+    /// any zoom and for anyone opening the review later.
+    fn place_spot(
+        &mut self,
+        position: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return;
+        }
+        let local = position - bounds.origin;
+        self.pending_spot = Some(Spot {
+            x: (f32::from(local.x) / f32::from(bounds.size.width)).clamp(0., 1.),
+            y: (f32::from(local.y) / f32::from(bounds.size.height)).clamp(0., 1.),
+        });
+        self.anchor = None;
+        self.reply_to = None;
+        self.status = None;
+        self.draft.update(cx, |draft, cx| {
+            draft.set_placeholder("Write a review comment…", cx);
+        });
+        self.draft.read(cx).focus(window);
+        cx.notify();
+    }
+
+    /// Comments already on the thing being looked at, in review order so the
+    /// pins carry the same numbers as the exported brief.
+    fn spots_here(&self, path: &str) -> Vec<(usize, String, Spot)> {
+        self.review
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, comment)| comment.path == path)
+            .filter_map(|(index, comment)| {
+                let spot = comment.anchor.spot()?;
+                // On a video, only pins for the moment on screen.
+                if let Some(seconds) = comment.anchor.seconds()
+                    && (seconds - self.time).abs() > 0.25
+                {
+                    return None;
+                }
+                Some((index + 1, comment.id.clone(), spot))
             })
             .collect()
+    }
+
+    /// A numbered pin over an image or frame.
+    fn render_pin(number: usize, id: &str, spot: Spot, pending: bool) -> gpui::Div {
+        div()
+            .absolute()
+            .left(relative(spot.x))
+            .top(relative(spot.y))
+            // Centre the pin on the point rather than hanging it off the corner.
+            .ml(px(-11.))
+            .mt(px(-11.))
+            .size(px(22.))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if pending {
+                fg(0.92)
+            } else {
+                rgb(ACCENT).into()
+            })
+            .border_2()
+            .border_color(scrim(0.55))
+            .text_size(px(11.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(scrim(0.8))
+            .child(if pending {
+                "＋".to_string()
+            } else {
+                let _ = id;
+                number.to_string()
+            })
+    }
+
+    /// The pane for something that is looked at rather than read: an image, or
+    /// a frame of a video with a timeline under it.
+    fn render_media(&self, file: &FileDiff, cx: &mut Context<Self>) -> gpui::Div {
+        let path = file.path.clone();
+        let still = (self.medium != Medium::Video).then(|| self.repository.root.join(&path));
+        let frame = self.frame.clone();
+        let spots = self.spots_here(&path);
+        let pending = self.pending_spot;
+
+        // A surface has no intrinsic size — unlike an image it contributes
+        // nothing to layout — so the video is given an explicit rect, fitted
+        // inside the stage. Fitting it ourselves rather than letting the
+        // element letterbox also keeps the pins on the picture: a spot is a
+        // fraction of the video, not of the empty space around it.
+        let video_rect = match (frame.as_ref(), self.stage_bounds) {
+            (Some(frame), Some(stage)) => Some(fit(
+                stage,
+                frame.get_width() as f32,
+                frame.get_height() as f32,
+            )),
+            _ => None,
+        };
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("media-stage")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(18.))
+                    // Stretched over the stage: a canvas sizes to its content,
+                    // which is nothing, and a zero-size rect would scale the
+                    // video down to nothing with it.
+                    .child(
+                        canvas(
+                            {
+                                let view = cx.entity();
+                                move |bounds, _, cx| {
+                                    view.update(cx, |view, _| view.stage_bounds = Some(bounds));
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .map(|element| {
+                        let Some(surface_element) =
+                            self.render_surface(still, frame, video_rect, spots, pending, cx)
+                        else {
+                            return element.child(Self::empty_state(
+                                "Opening the clip",
+                                "AVFoundation is loading it. If this never finishes, the file \
+                                 may not be a format macOS can decode.",
+                            ));
+                        };
+                        element.child(surface_element)
+                    }),
+            )
+            .when(self.medium == Medium::Video, |element| {
+                element.child(self.render_timeline(cx))
+            })
+    }
+
+    /// The picture: a decoded frame at its fitted rect, or a still image that
+    /// sizes itself. Pins and clicks land on whichever it is, so a spot always
+    /// means a fraction of the picture.
+    #[allow(clippy::type_complexity)]
+    fn render_surface(
+        &self,
+        still: Option<PathBuf>,
+        frame: Option<CVPixelBuffer>,
+        video_rect: Option<Bounds<Pixels>>,
+        spots: Vec<(usize, String, Spot)>,
+        pending: Option<Spot>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let stage = self.stage_bounds;
+        let body = div()
+            .id("media-surface")
+            .relative()
+            .cursor_crosshair()
+            .children(
+                spots
+                    .into_iter()
+                    .map(|(number, id, spot)| Self::render_pin(number, &id, spot, false))
+                    .chain(pending.map(|spot| Self::render_pin(0, "", spot, true))),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    if let Some(bounds) = this.media_bounds {
+                        this.place_spot(event.position, bounds, window, cx);
+                    }
+                }),
+            )
+            .child(
+                canvas(
+                    {
+                        let view = cx.entity();
+                        move |bounds, _, cx| {
+                            view.update(cx, |view, _| view.media_bounds = Some(bounds));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
+
+        match (frame, still) {
+            (Some(frame), _) => {
+                let (rect, stage) = (video_rect?, stage?);
+                Some(
+                    body.absolute()
+                        .left(rect.origin.x - stage.origin.x)
+                        .top(rect.origin.y - stage.origin.y)
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .child(surface(frame).size_full()),
+                )
+            }
+            (_, Some(still)) => Some(
+                body.max_w_full()
+                    .max_h_full()
+                    .child(img(still).max_w_full().max_h_full()),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The scrubber. Clicking it seeks; the ticks are the moments already
+    /// carrying a comment, so a review reads back as marks on the timeline.
+    fn render_timeline(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let duration = self.probe.map(|probe| probe.duration).unwrap_or(0.);
+        let progress = if duration > 0. {
+            (self.time / duration) as f32
+        } else {
+            0.
+        };
+        let path = self
+            .diff
+            .files
+            .get(self.selected_file)
+            .map(|file| file.path.clone())
+            .unwrap_or_default();
+        let marks: Vec<f32> = self
+            .review
+            .comments
+            .iter()
+            .filter(|comment| comment.path == path)
+            .filter_map(|comment| comment.anchor.seconds())
+            .filter(|_| duration > 0.)
+            .map(|seconds| (seconds / duration) as f32)
+            .collect();
+
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(18.))
+            .py(px(12.))
+            .border_t_1()
+            .border_color(fg(0.08))
+            .child(
+                div()
+                    .id("timeline")
+                    .relative()
+                    .h(px(22.))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            let Some(bounds) = this.timeline_bounds else {
+                                return;
+                            };
+                            let width = f32::from(bounds.size.width);
+                            if width <= 0. {
+                                return;
+                            }
+                            let ratio = (f32::from(event.position.x - bounds.origin.x) / width)
+                                .clamp(0., 1.);
+                            let duration = this.probe.map(|probe| probe.duration).unwrap_or(0.);
+                            this.seek(f64::from(ratio) * duration, cx);
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            {
+                                let view = cx.entity();
+                                move |bounds, _, cx| {
+                                    view.update(cx, |view, _| view.timeline_bounds = Some(bounds));
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    // Track.
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(9.))
+                            .left_0()
+                            .right_0()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(fg(0.1)),
+                    )
+                    // Played.
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(9.))
+                            .left_0()
+                            .w(relative(progress))
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(tint(ACCENT, 0.75)),
+                    )
+                    // Moments already commented on.
+                    .children(marks.into_iter().map(|at| {
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .left(relative(at))
+                            .w(px(2.))
+                            .h(px(14.))
+                            .rounded_full()
+                            .bg(rgb(ACCENT))
+                    }))
+                    // Playhead.
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .left(relative(progress))
+                            .ml(px(-1.))
+                            .w(px(2.))
+                            .h(px(18.))
+                            .rounded_full()
+                            .bg(fg(0.95)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .font_family(MONO)
+                    .text_size(px(11.))
+                    .text_color(ink())
+                    .child(
+                        holds_the_mouse(div().id("play"))
+                            .flex_none()
+                            .size(px(24.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(fg(0.08))
+                            .text_size(px(10.))
+                            .text_color(ink())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(fg(0.14)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx)))
+                            .child(if self.is_playing() { "❚❚" } else { "▶" }),
+                    )
+                    .child(match self.probe {
+                        Some(probe) => format!(
+                            "{}  ·  frame {}",
+                            media::timecode(self.time),
+                            probe.frame_at(self.time)
+                        ),
+                        None => media::timecode(self.time),
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        self.probe
+                            .map(|probe| media::timecode(probe.duration))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+            )
     }
 
     fn empty_state(title: &'static str, message: &'static str) -> gpui::Div {
@@ -1392,6 +2040,23 @@ fn gutter_width(file: &FileDiff) -> Pixels {
     // pixel for the divider.
     let digits = widest.to_string().len() as f32;
     px((digits * 8. + 13.).max(GUTTER))
+}
+
+/// The largest rect of a given aspect that fits inside `stage`, centred.
+fn fit(stage: Bounds<Pixels>, width: f32, height: f32) -> Bounds<Pixels> {
+    if width <= 0. || height <= 0. {
+        return stage;
+    }
+    let available = (f32::from(stage.size.width), f32::from(stage.size.height));
+    let scale = (available.0 / width).min(available.1 / height);
+    let (drawn_width, drawn_height) = (width * scale, height * scale);
+    Bounds {
+        origin: point(
+            stage.origin.x + px((available.0 - drawn_width) / 2.),
+            stage.origin.y + px((available.1 - drawn_height) / 2.),
+        ),
+        size: size(px(drawn_width), px(drawn_height)),
+    }
 }
 
 /// Diff plumbing that carries no information the header doesn't already show.
@@ -1478,10 +2143,6 @@ impl Render for ReviewView {
             if file_count == 1 { "" } else { "s" },
             if note_count == 1 { "" } else { "s" }
         );
-        let diff_rows = selected_file
-            .map(|file| self.render_diff_rows(self.selected_file, file, window, cx))
-            .unwrap_or_default();
-        let file_groups = self.render_file_groups(cx);
 
         // Sidebar — part of the window itself, painted straight onto the glass
         // with no panel fill or divider, exactly like tgip's.
@@ -1566,16 +2227,25 @@ impl Render for ReviewView {
                 ),
             )
             .child(
-                // Chrome, so the gaps between and below the groups drag the
+                // Chrome, so the gaps between and below the rows drag the
                 // window. The rows themselves opt out.
                 draggable(div())
-                    .id("file-list")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .px(px(4.))
                     .pb(px(6.))
-                    .children(file_groups),
+                    .child(
+                        uniform_list(
+                            "file-list",
+                            self.sidebar_rows.len(),
+                            cx.processor(|this, range: Range<usize>, _window, cx| {
+                                range
+                                    .map(|index| this.render_sidebar_row(index, cx))
+                                    .collect()
+                            }),
+                        )
+                        .size_full(),
+                    ),
             )
             .when_some(self.update.clone(), |element, version| {
                 let command = update::Install::detect().upgrade_hint();
@@ -1731,20 +2401,36 @@ impl Render for ReviewView {
                     ),
             )
             .child(Self::divider(0.1))
-            .child(
-                div()
-                    .id("diff-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .children(diff_rows)
-                    .when(self.diff.files.is_empty(), |element| {
-                        element.child(Self::empty_state(
-                            "Working tree is clean",
-                            "No tracked, staged, or untracked changes are waiting for review.",
-                        ))
+            // A render is read by looking at it, not by scrolling a patch.
+            .map(|element| match (self.medium, selected_file) {
+                (Medium::Text, _) | (_, None) => element.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .when(self.diff.files.is_empty(), |element| {
+                            element.child(Self::empty_state(
+                                "Working tree is clean",
+                                "No tracked, staged, or untracked changes are waiting for review.",
+                            ))
+                        })
+                        .when(!self.diff.files.is_empty(), |element| {
+                            element.child(
+                                list(
+                                    self.diff_list.clone(),
+                                    cx.processor(|this, index: usize, window, cx| {
+                                        this.render_diff_row(index, window, cx)
+                                    }),
+                                )
+                                .size_full(),
+                            )
+                        }),
+                ),
+                (_, Some(file)) => element
+                    .child(self.render_media(file, cx))
+                    .when(self.pending_spot.is_some(), |element| {
+                        element.child(self.render_inline_composer(None, px(0.), window, cx))
                     }),
-            );
+            });
 
         div()
             .track_focus(&self.focus)
@@ -1821,6 +2507,38 @@ mod tests {
                 text: "+value".into(),
             }],
         }
+    }
+
+    /// A surface has no intrinsic size, so the video's rect is computed rather
+    /// than laid out. Getting it wrong once meant a black pane with audio.
+    #[test]
+    fn video_is_fitted_inside_the_stage() {
+        let stage = Bounds {
+            origin: point(px(10.), px(20.)),
+            size: size(px(800.), px(600.)),
+        };
+
+        // Wider than the stage: letterboxed, pinned to full width.
+        let wide = fit(stage, 1920., 1080.);
+        assert_eq!(wide.size.width, px(800.));
+        assert_eq!(wide.size.height, px(450.));
+        assert_eq!(wide.origin.x, px(10.));
+        assert_eq!(wide.origin.y, px(20. + 75.)); // centred vertically
+
+        // Taller than the stage — a 9:16 render — pillarboxed.
+        let tall = fit(stage, 1080., 1920.);
+        assert_eq!(tall.size.height, px(600.));
+        assert_eq!(tall.size.width, px(337.5));
+        assert_eq!(tall.origin.y, px(20.));
+    }
+
+    #[test]
+    fn a_degenerate_frame_does_not_divide_by_zero() {
+        let stage = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(100.), px(100.)),
+        };
+        assert_eq!(fit(stage, 0., 0.).size, stage.size);
     }
 
     #[test]

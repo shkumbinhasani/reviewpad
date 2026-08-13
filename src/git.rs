@@ -43,6 +43,25 @@ pub enum LineKind {
 }
 
 impl FileDiff {
+    /// A file to look at rather than read a patch of.
+    ///
+    /// Render output is normally gitignored — `out/` in a Remotion project —
+    /// so a rendered video never reaches the diff at all. It is still the thing
+    /// under review, so it can be named directly and carries no lines.
+    pub fn media(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            additions: 0,
+            deletions: 0,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Whether this entry came from a patch or was named directly.
+    pub fn is_media(&self) -> bool {
+        self.lines.is_empty()
+    }
+
     /// Index of the diff row carrying a given side and line number.
     pub fn index_of(&self, side: Side, line: u32) -> Option<usize> {
         self.lines
@@ -134,28 +153,69 @@ impl Repository {
     }
 
     pub fn diff(&self) -> Result<DiffSet> {
-        let mut patch = tracked_patch(&self.root)?;
+        let patch = tracked_patch(&self.root)?;
+        let mut diff = parse_unified_diff(&patch);
+        diff.files.extend(self.untracked_files()?);
+        Ok(diff)
+    }
+
+    /// Untracked files, read directly rather than diffed one subprocess at a
+    /// time.
+    ///
+    /// `git diff --no-index` per file is fine for a handful and ruinous for a
+    /// real project: a Remotion tree with 372 untracked files spent 8.3s in
+    /// subprocesses before the window could open, and expanded 472MB of audio
+    /// and stills into a patch nobody can read. Anything binary or oversized
+    /// becomes an entry with no lines — it is listed, and looked at rather than
+    /// diffed.
+    fn untracked_files(&self) -> Result<Vec<FileDiff>> {
+        let mut files = Vec::new();
+
         for path in untracked_paths(&self.root)? {
-            let output = git_output(
-                &self.root,
-                &[
-                    "diff",
-                    "--no-index",
-                    "--no-ext-diff",
-                    "--",
-                    "/dev/null",
-                    &path,
-                ],
-            )?;
-            // git diff --no-index returns 1 when it successfully finds a difference.
-            if !output.status.success() && output.status.code() != Some(1) {
-                bail!("failed to diff untracked file {}", path);
+            let full = self.root.join(&path);
+            let size = std::fs::metadata(&full).map(|meta| meta.len()).unwrap_or(0);
+            if size > MAX_UNTRACKED_BYTES {
+                files.push(FileDiff::media(path));
+                continue;
             }
-            patch.push_str(&String::from_utf8_lossy(&output.stdout));
+
+            let Ok(bytes) = std::fs::read(&full) else {
+                continue;
+            };
+            // A null byte is the same test git uses to call a file binary.
+            if bytes.contains(&0) {
+                files.push(FileDiff::media(path));
+                continue;
+            }
+
+            let text = String::from_utf8_lossy(&bytes);
+            let mut lines = vec![DiffLine {
+                kind: LineKind::Header,
+                old_line: None,
+                new_line: None,
+                text: format!("new file {path}"),
+            }];
+            lines.extend(text.lines().enumerate().map(|(index, line)| DiffLine {
+                kind: LineKind::Addition,
+                old_line: None,
+                new_line: Some(index as u32 + 1),
+                text: format!("+{line}"),
+            }));
+
+            files.push(FileDiff {
+                path,
+                additions: lines.len().saturating_sub(1),
+                deletions: 0,
+                lines,
+            });
         }
-        Ok(parse_unified_diff(&patch))
+
+        Ok(files)
     }
 }
+
+/// Untracked files past this are listed but not expanded into the diff.
+const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 
 fn tracked_patch(root: &Path) -> Result<String> {
     let args = [

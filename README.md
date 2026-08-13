@@ -11,6 +11,10 @@ ReviewPad is a local-first Git review tool with one Rust binary and two interfac
 
 ![ReviewPad reviewing a TypeScript diff](assets/reviewpad-screenshot.png)
 
+It reviews code, and it reviews renders: a video can be played and commented on
+at a given moment, an image at a given place, and both come back out as
+something an agent can act on.
+
 It reads staged, unstaged, and untracked changes. Comments are anchored to old or new line numbers and stored in `.reviewpad/comments.json` at the repository root, where an agent can read them directly. That directory ignores itself, so review state never dirties the working tree it is inspecting. A review still living under the old `.git/reviewpad/` path is migrated forward the first time it is opened.
 
 ## Install
@@ -97,6 +101,46 @@ reviewpad list .     # list comments with their ids
 reviewpad clear .    # remove all saved comments
 ```
 
+### Reviewing renders
+
+A changed video or image opens as itself rather than as a patch. Video plays
+through AVFoundation — hardware decode, audio, real seeking — and clicking the
+picture drops a pin.
+
+Render output is usually gitignored, so a rendered file has to be named:
+
+```sh
+reviewpad open . --include out/promo.mp4
+```
+
+Anything already carrying a comment is included automatically, so a render
+commented on from the CLI is reachable in the panel afterwards.
+
+Comments anchor to what the file is:
+
+```sh
+# A moment in a video. The frame is recorded alongside the time, because a
+# composition is written in frames.
+reviewpad comment out/promo.mp4 --time 12.5 --body "The slide should ease out."
+
+# A moment and a place in that frame.
+reviewpad comment out/promo.mp4 --time 4.0 --spot 0.8,0.5 --body "Exits early."
+
+# A place on an image. Percentages work too.
+reviewpad comment design/hero.png --spot 50%,20% --body "Too much headroom."
+```
+
+which an agent reads back as:
+
+```
+## 1. `out/promo.mp4` — 0:12.500 · frame 375 — c1
+
+The slide should ease out.
+```
+
+Spots are normalized to 0..1, so they stay correct whatever size the media is
+displayed at.
+
 ### Writing comments and replying
 
 An agent can leave notes of its own and answer the ones it was given. Every
@@ -132,6 +176,8 @@ to thread `c1`.
 ## Data and scope
 
 - Diffs come from the current working tree relative to `HEAD`, plus untracked files.
+- Untracked files are read directly rather than diffed one subprocess at a time; binary and oversized ones are listed without a patch.
+- Video is decoded by AVFoundation into buffers GPUI binds as textures, so nothing is written to disk to play a clip.
 - Review state is repository-local and survives closing the app.
 - Comments and replies share one file, so the app and the CLI see each other's notes.
 - ReviewPad never stages, resets, commits, or modifies project files.
