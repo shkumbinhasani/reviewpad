@@ -1100,17 +1100,52 @@ impl ReviewView {
         };
 
         holds_the_mouse(div().id(("file", index)))
+            .group("file-row")
+            .relative()
+            .overflow_hidden()
             .w_full()
+            // Fixed box: every state has the same height, padding and border,
+            // so nothing about the row moves as the pointer crosses it.
+            .h(px(26.))
             .flex()
             .items_center()
             .gap(px(9.))
             .px(px(9.))
-            .py(px(6.))
             .rounded(px(8.))
-            .bg(if selected { fg(0.12) } else { fg(0.) })
+            // The selected row is lit the way the secondary buttons are —
+            // neutral, not the accent, which was far too loud for something a
+            // whole column of rows can be. Its ring, sheen and shadow are what
+            // separate it from a hover, rather than a brighter colour.
+            .bg(if selected { fg(0.1) } else { fg(0.) })
+            .border_1()
+            .border_color(if selected { fg(0.16) } else { fg(0.) })
+            .when(selected, |element| {
+                element.shadow(vec![BoxShadow {
+                    color: scrim(0.28),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(3.),
+                    spread_radius: px(0.),
+                }])
+            })
             .cursor_pointer()
-            .hover(|style| style.bg(if selected { fg(0.14) } else { fg(0.06) }))
+            .hover(|style| if selected { style } else { style.bg(fg(0.06)) })
             .on_click(cx.listener(move |this, _, _, cx| this.select_file(index, cx)))
+            // The face, under everything else so the name stays legible.
+            .when(selected, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded(px(8.))
+                        .bg(gpui::linear_gradient(
+                            180.,
+                            gpui::linear_color_stop(fg(0.2), 0.),
+                            gpui::linear_color_stop(fg(0.), 0.62),
+                        ))
+                        .opacity(0.6)
+                        .group_hover("file-row", |style| style.opacity(1.)),
+                )
+            })
             .child(
                 div()
                     .w(px(12.))
@@ -1126,11 +1161,10 @@ impl ReviewView {
                     .flex_1()
                     .truncate()
                     .text_size(px(12.5))
-                    .font_weight(if selected {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
+                    // Constant weight: bolding on selection reflows the name
+                    // and the row changes size under the pointer. The colour
+                    // and the ring carry the state instead.
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(ink())
                     .child(name.to_string()),
             )
