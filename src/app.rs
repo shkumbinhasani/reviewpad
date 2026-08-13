@@ -2,8 +2,8 @@ use anyhow::Result;
 use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, FocusHandle,
     Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, StyledText, Window,
-    WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size, svg,
+    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement, StyledText,
+    Window, WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use std::ops::Range;
 
@@ -28,7 +28,7 @@ const CARD_RADIUS: f32 = 10.;
 const SIDEBAR_WIDTH: f32 = 262.;
 /// Vertical room the sidebar leaves for the traffic lights.
 const TITLEBAR_INSET: f32 = 32.;
-/// Width of each line-number gutter.
+/// Minimum width of a line-number gutter, widened per file by `gutter_width`.
 const GUTTER: f32 = 44.;
 /// Width of the +/− column, tgip's marker column narrowed for the gutters.
 const MARKER: f32 = 24.;
@@ -829,6 +829,7 @@ impl ReviewView {
         file_index: usize,
         line_index: usize,
         line: &DiffLine,
+        gutter: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let selected = self
@@ -897,19 +898,21 @@ impl ReviewView {
             })
             .child(
                 div()
-                    .w(px(GUTTER))
+                    .w(gutter)
                     .flex_none()
                     .px(px(6.))
                     .text_right()
+                    .whitespace_nowrap()
                     .text_color(fg(0.24))
                     .child(old),
             )
             .child(
                 div()
-                    .w(px(GUTTER))
+                    .w(gutter)
                     .flex_none()
                     .px(px(6.))
                     .text_right()
+                    .whitespace_nowrap()
                     .border_r_1()
                     .border_color(fg(0.08))
                     .text_color(fg(0.32))
@@ -920,6 +923,7 @@ impl ReviewView {
                     .w(px(MARKER))
                     .flex_none()
                     .text_center()
+                    .whitespace_nowrap()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(hex(marker_color))
                     .child(marker),
@@ -1067,6 +1071,7 @@ impl ReviewView {
         &self,
         index: usize,
         comment: ReviewComment,
+        gutter: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let group = format!("thread-{index}");
@@ -1109,7 +1114,7 @@ impl ReviewView {
         div()
             .id(("inline-comment", index))
             .group(group)
-            .pl(px(GUTTER * 2. + MARKER))
+            .pl(gutter + gutter + px(MARKER))
             .pr(px(18.))
             .py(px(6.))
             .bg(fg(0.02))
@@ -1129,6 +1134,7 @@ impl ReviewView {
     fn render_inline_composer(
         &self,
         line: Option<&DiffLine>,
+        gutter: Pixels,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1144,7 +1150,7 @@ impl ReviewView {
 
         div()
             .id("composer")
-            .pl(px(GUTTER * 2. + MARKER))
+            .pl(gutter + gutter + px(MARKER))
             .pr(px(18.))
             // A reply tucks under the thread it answers; a new comment stands
             // on its own beneath the line.
@@ -1232,6 +1238,7 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut rows = Vec::new();
+        let gutter = gutter_width(file);
 
         for (line_index, line) in file.lines.iter().enumerate() {
             // The path and mode are already in the header, so the raw `---`,
@@ -1247,7 +1254,7 @@ impl ReviewView {
             }
 
             rows.push(
-                self.render_line(file_index, line_index, line, cx)
+                self.render_line(file_index, line_index, line, gutter, cx)
                     .into_any_element(),
             );
 
@@ -1259,12 +1266,12 @@ impl ReviewView {
                             .as_deref()
                             .is_some_and(|target| thread_of(target) == comment.id);
                         rows.push(
-                            self.render_inline_comment(comment_index, comment.clone(), cx)
+                            self.render_inline_comment(comment_index, comment.clone(), gutter, cx)
                                 .into_any_element(),
                         );
                         if answering {
                             rows.push(
-                                self.render_inline_composer(Some(line), window, cx)
+                                self.render_inline_composer(Some(line), gutter, window, cx)
                                     .into_any_element(),
                             );
                         }
@@ -1278,7 +1285,7 @@ impl ReviewView {
                 .is_some_and(|anchor| anchor.file == file_index && anchor.line == line_index)
             {
                 rows.push(
-                    self.render_inline_composer(Some(line), window, cx)
+                    self.render_inline_composer(Some(line), gutter, window, cx)
                         .into_any_element(),
                 );
             }
@@ -1365,6 +1372,26 @@ impl ReviewView {
                     .child(message),
             )
     }
+}
+
+/// Width for a line-number column that fits the file's widest number.
+///
+/// The columns are fixed width, and a number too wide for one wraps inside it —
+/// which doubles the row's height and reads as a blank line that isn't in the
+/// diff at all. Four digits only just fitted the old fixed 44px, and the second
+/// column lost another pixel to its border, so five-figure files wrapped every
+/// row.
+fn gutter_width(file: &FileDiff) -> Pixels {
+    let widest = file
+        .lines
+        .iter()
+        .filter_map(|line| line.new_line.max(line.old_line))
+        .max()
+        .unwrap_or(1);
+    // ~8px per digit at 13px monospace, plus the 6px padding on each side and a
+    // pixel for the divider.
+    let digits = widest.to_string().len() as f32;
+    px((digits * 8. + 13.).max(GUTTER))
 }
 
 /// Diff plumbing that carries no information the header doesn't already show.
@@ -1753,6 +1780,47 @@ mod tests {
         let (text, highlights) = expand_tabs("let x", &[(0..3, 9)]);
         assert_eq!(text.as_ref(), "let x");
         assert_eq!(highlights[0].0, 0..3);
+    }
+
+    /// The gutter has to fit the file's widest line number. When it did not,
+    /// the number wrapped inside the column, doubling the row height so the
+    /// diff appeared to contain blank lines that were never in it.
+    #[test]
+    fn the_gutter_grows_with_the_line_numbers() {
+        let narrow = gutter_width(&file_ending_at(42));
+        let wide = gutter_width(&file_ending_at(10_046));
+        assert!(wide > narrow, "{wide:?} should exceed {narrow:?}");
+
+        // Five digits at ~8px plus padding, and never below the minimum.
+        assert!(wide >= px(53.));
+        assert_eq!(narrow, px(GUTTER));
+        assert_eq!(gutter_width(&file_ending_at(1)), px(GUTTER));
+    }
+
+    /// A file with no numbered lines at all must still lay out.
+    #[test]
+    fn an_empty_file_still_gets_a_gutter() {
+        let file = FileDiff {
+            path: "empty.rs".into(),
+            additions: 0,
+            deletions: 0,
+            lines: Vec::new(),
+        };
+        assert_eq!(gutter_width(&file), px(GUTTER));
+    }
+
+    fn file_ending_at(last: u32) -> FileDiff {
+        FileDiff {
+            path: "src/lib.rs".into(),
+            additions: 1,
+            deletions: 0,
+            lines: vec![DiffLine {
+                kind: LineKind::Addition,
+                old_line: None,
+                new_line: Some(last),
+                text: "+value".into(),
+            }],
+        }
     }
 
     #[test]
