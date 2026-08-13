@@ -1,6 +1,6 @@
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, FocusHandle,
+    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, FocusHandle,
     Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton,
     PathPromptOptions, Render, SharedString, StatefulInteractiveElement, StyledText, Window,
     WindowBounds, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size, svg,
@@ -9,6 +9,7 @@ use std::ops::Range;
 
 use reviewpad::{
     avatar,
+    field::{self, FieldStyle, TextField},
     git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
     review::{Review, ReviewComment, thread_of},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
@@ -92,6 +93,12 @@ fn scrim(alpha: f32) -> Hsla {
     }
 }
 
+/// Sidebar text. It used to run through a dozen alphas from 0.30 up, and the
+/// faint end was unreadable over a blurred desktop — one weight throughout.
+fn ink() -> Hsla {
+    fg(0.9)
+}
+
 fn hex(value: u32) -> Hsla {
     rgba(value).into()
 }
@@ -130,6 +137,50 @@ impl gpui::AssetSource for Assets {
     }
 }
 
+/// Native window dragging.
+///
+/// gpui 0.2.2 leaves `Window::start_window_move` as an empty default on macOS,
+/// so this goes to AppKit directly. `performWindowDragWithEvent:` is the call a
+/// custom titlebar uses, and it is what tgip's draggable background does.
+mod window_drag {
+    #[cfg(target_os = "macos")]
+    pub(super) fn start() {
+        use objc::{msg_send, runtime::Object, sel, sel_impl};
+
+        unsafe {
+            let app: *mut Object = msg_send![objc::class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let event: *mut Object = msg_send![app, currentEvent];
+            if event.is_null() {
+                return;
+            }
+            let window: *mut Object = msg_send![event, window];
+            if window.is_null() {
+                return;
+            }
+            let _: () = msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn start() {}
+}
+
+/// Mark a region as window chrome: dragging it moves the window.
+fn draggable(element: gpui::Div) -> gpui::Div {
+    element.on_mouse_down(MouseButton::Left, |_, _, _| window_drag::start())
+}
+
+/// Opt an element out of the window drag around it. Mouse events bubble in
+/// gpui, so anything clickable sitting on draggable chrome has to say so, or
+/// pressing it starts dragging the window instead. Only the press is stopped —
+/// `on_click` fires on release and still runs.
+fn holds_the_mouse(element: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
+    element.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
 #[derive(Clone)]
 struct Anchor {
     file: usize,
@@ -155,6 +206,7 @@ pub fn run(repository: Repository, diff: DiffSet, print_on_finish: bool) -> Resu
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
+            field::bind_keys(cx);
             open_review_window(cx, repository, diff, review, print_on_finish);
         });
     Ok(())
@@ -164,6 +216,7 @@ pub fn run(repository: Repository, diff: DiffSet, print_on_finish: bool) -> Resu
 /// choose a Git repository with the native directory picker.
 pub fn pick_and_run() -> Result<()> {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        field::bind_keys(cx);
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -236,7 +289,18 @@ fn open_review_window(
                 selected_file: 0,
                 anchor: None,
                 reply_to: None,
-                draft: String::new(),
+                draft: field::text_field(
+                    "Write a review comment…",
+                    FieldStyle {
+                        text: fg(0.92),
+                        placeholder: fg(0.38),
+                        selection: tint(ACCENT, 0.28),
+                        caret: rgb(ACCENT).into(),
+                        font_size: px(13.),
+                        line_height: px(19.),
+                    },
+                    cx,
+                ),
                 focus: cx.focus_handle(),
                 print_on_finish,
                 status: None,
@@ -268,7 +332,9 @@ struct ReviewView {
     /// Id of the thread the composer is answering, when it is not anchored to a
     /// diff line.
     reply_to: Option<String>,
-    draft: String,
+    /// The composer. A real field, so it selects, moves and composes like any
+    /// other text input rather than accumulating keystrokes.
+    draft: Entity<TextField>,
     focus: FocusHandle,
     print_on_finish: bool,
     status: Option<String>,
@@ -294,7 +360,7 @@ impl ReviewView {
         self.selected_file = index;
         self.anchor = None;
         self.reply_to = None;
-        self.draft.clear();
+        self.clear_draft(cx);
         self.refresh_highlight();
         cx.notify();
     }
@@ -410,7 +476,10 @@ impl ReviewView {
         self.anchor = Some(Anchor { file, line });
         self.reply_to = None;
         self.status = None;
-        window.focus(&self.focus);
+        self.draft.update(cx, |draft, cx| {
+            draft.set_placeholder("Write a review comment…", cx);
+        });
+        self.draft.read(cx).focus(window);
         cx.notify();
     }
 
@@ -425,51 +494,32 @@ impl ReviewView {
         }
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let composing = self.anchor.is_some() || self.reply_to.is_some();
 
         match key {
             // Outside the composer the arrows walk the file list, so the diff
-            // is navigable without reaching for the mouse.
-            "up" if !composing => {
-                self.step_file(-1, cx);
-                return;
-            }
-            "down" if !composing => {
-                self.step_file(1, cx);
-                return;
-            }
-            "v" if modifiers.platform && composing => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.draft.push_str(&text);
-                }
-            }
-            "backspace" if composing => {
-                self.draft.pop();
-            }
+            // is navigable without reaching for the mouse. Inside it, the field
+            // has already consumed them.
+            "up" if !composing => self.step_file(-1, cx),
+            "down" if !composing => self.step_file(1, cx),
+            // Submit and dismiss stay with the view; every other keystroke is
+            // the field's business.
             "enter" if composing && (modifiers.platform || modifiers.control) => {
-                self.add_comment(cx);
-                return;
+                self.add_comment(cx)
             }
-            "enter" if composing => self.draft.push('\n'),
             "escape" => {
-                self.draft.clear();
-                self.anchor = None;
+                self.cancel_comment(cx);
+                self.reclaim_focus(window);
             }
-            _ if composing && !modifiers.platform && !modifiers.control && !modifiers.function => {
-                if let Some(character) = &event.keystroke.key_char {
-                    self.draft.push_str(character);
-                }
-            }
-            _ => return,
+            _ => {}
         }
-        cx.notify();
     }
 
     fn add_comment(&mut self, cx: &mut Context<Self>) {
-        let body = self.draft.trim().to_string();
+        let body = self.draft.read(cx).text().trim().to_string();
         if body.is_empty() {
             self.status = Some("Write a comment first".into());
             cx.notify();
@@ -513,9 +563,14 @@ impl ReviewView {
         self.finish_composing("Comment saved", cx);
     }
 
+    /// Empty the composer.
+    fn clear_draft(&mut self, cx: &mut Context<Self>) {
+        self.draft.update(cx, |draft, cx| draft.clear(cx));
+    }
+
     /// Clear the composer and persist, reporting whichever outcome the save had.
     fn finish_composing(&mut self, saved: &str, cx: &mut Context<Self>) {
-        self.draft.clear();
+        self.clear_draft(cx);
         self.anchor = None;
         self.reply_to = None;
         self.status = match self.review.save(&self.repository.review_path()) {
@@ -531,7 +586,7 @@ impl ReviewView {
         }
         if self.reply_to.as_deref() == Some(id.as_str()) {
             self.reply_to = None;
-            self.draft.clear();
+            self.clear_draft(cx);
         }
         self.status = match self.review.save(&self.repository.review_path()) {
             Ok(()) => Some("Comment removed".into()),
@@ -544,18 +599,26 @@ impl ReviewView {
     fn start_reply(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.reply_to = Some(id);
         self.anchor = None;
-        self.draft.clear();
+        self.clear_draft(cx);
         self.status = None;
-        window.focus(&self.focus);
+        self.draft.update(cx, |draft, cx| {
+            draft.set_placeholder("Write a reply…", cx);
+        });
+        self.draft.read(cx).focus(window);
         cx.notify();
     }
 
     fn cancel_comment(&mut self, cx: &mut Context<Self>) {
-        self.draft.clear();
+        self.clear_draft(cx);
         self.anchor = None;
         self.reply_to = None;
         self.status = None;
         cx.notify();
+    }
+
+    /// Return focus to the view so the file-list shortcuts work again.
+    fn reclaim_focus(&self, window: &mut Window) {
+        window.focus(&self.focus);
     }
 
     /// Put the upgrade command on the clipboard — the app never rewrites itself
@@ -597,14 +660,13 @@ impl ReviewView {
         label: impl Into<SharedString>,
         primary: bool,
     ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .px(px(10.))
-            .py(px(6.))
-            .rounded(px(6.))
+        holds_the_mouse(div().id(id))
+            .px(px(13.))
+            .py(px(4.))
+            .rounded_full()
             .text_size(px(12.))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(if primary { tint(ACCENT, 0.96) } else { fg(0.5) })
+            .text_color(if primary { tint(ACCENT, 0.96) } else { ink() })
             .bg(if primary { hex(ACCENT_FILL) } else { fg(0.06) })
             .border_1()
             .border_color(if primary { tint(ACCENT, 0.22) } else { fg(0.) })
@@ -659,8 +721,7 @@ impl ReviewView {
             (TINT_DELETED, "−")
         };
 
-        div()
-            .id(("file", index))
+        holds_the_mouse(div().id(("file", index)))
             .flex()
             .items_center()
             .gap(px(9.))
@@ -691,7 +752,7 @@ impl ReviewView {
                     } else {
                         FontWeight::NORMAL
                     })
-                    .text_color(fg(if selected { 0.95 } else { 0.74 }))
+                    .text_color(ink())
                     .child(name.to_string()),
             )
             .child(
@@ -963,10 +1024,10 @@ impl ReviewView {
                             .child(
                                 div()
                                     .id(("reply-to", key))
-                                    .px(px(6.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
-                                    .text_color(fg(0.45))
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .rounded_full()
+                                    .text_color(ink())
                                     .cursor_pointer()
                                     .hover(|style| style.bg(fg(0.08)).text_color(tint(ACCENT, 1.)))
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -977,10 +1038,10 @@ impl ReviewView {
                             .child(
                                 div()
                                     .id(("remove-message", key))
-                                    .px(px(6.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
-                                    .text_color(fg(0.45))
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .rounded_full()
+                                    .text_color(ink())
                                     .cursor_pointer()
                                     .hover(|style| style.bg(fg(0.08)).text_color(hex(DEL_MARK)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1068,25 +1129,17 @@ impl ReviewView {
     fn render_inline_composer(
         &self,
         line: Option<&DiffLine>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let replying = self.reply_to.is_some();
+        let focused = self.draft.read(cx).is_focused(window);
         let heading = match (&self.reply_to, line.and_then(DiffLine::anchor)) {
             (Some(target), _) => format!("Replying to {target}"),
             (None, Some((side, number))) => {
                 format!("New comment · line {number} · {}", side.label())
             }
             (None, None) => "New comment".to_string(),
-        };
-        let placeholder = if replying {
-            "Write a reply…"
-        } else {
-            "Write a review comment…"
-        };
-        let draft = if self.draft.is_empty() {
-            placeholder.to_string()
-        } else {
-            format!("{}▍", self.draft)
         };
 
         div()
@@ -1120,11 +1173,11 @@ impl ReviewView {
                             .child(
                                 div()
                                     .id("cancel-inline")
-                                    .px(px(6.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .rounded_full()
                                     .text_size(px(11.))
-                                    .text_color(fg(0.45))
+                                    .text_color(ink())
                                     .cursor_pointer()
                                     .hover(|style| style.bg(fg(0.08)).text_color(fg(0.9)))
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_comment(cx)))
@@ -1139,14 +1192,12 @@ impl ReviewView {
                             .py(px(9.))
                             .rounded(px(6.))
                             .border_1()
-                            .border_color(fg(0.1))
+                            // The composer sits inside a diff that also takes
+                            // key input, so the border says which one has the
+                            // keyboard.
+                            .border_color(if focused { tint(ACCENT, 0.6) } else { fg(0.1) })
                             .bg(scrim(0.28))
-                            .whitespace_normal()
-                            .text_size(px(13.))
-                            .line_height(px(19.))
-                            .text_color(fg(if self.draft.is_empty() { 0.38 } else { 0.92 }))
-                            .cursor_text()
-                            .child(draft),
+                            .child(self.draft.clone()),
                     )
                     .child(
                         div()
@@ -1177,6 +1228,7 @@ impl ReviewView {
         &self,
         file_index: usize,
         file: &FileDiff,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut rows = Vec::new();
@@ -1212,7 +1264,7 @@ impl ReviewView {
                         );
                         if answering {
                             rows.push(
-                                self.render_inline_composer(Some(line), cx)
+                                self.render_inline_composer(Some(line), window, cx)
                                     .into_any_element(),
                             );
                         }
@@ -1226,7 +1278,7 @@ impl ReviewView {
                 .is_some_and(|anchor| anchor.file == file_index && anchor.line == line_index)
             {
                 rows.push(
-                    self.render_inline_composer(Some(line), cx)
+                    self.render_inline_composer(Some(line), window, cx)
                         .into_any_element(),
                 );
             }
@@ -1262,7 +1314,7 @@ impl ReviewView {
                             .font_family(MONO)
                             .text_size(px(10.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg(0.4))
+                            .text_color(ink())
                             .child(if parent.is_empty() {
                                 "./".to_string()
                             } else {
@@ -1374,7 +1426,7 @@ fn styles(spans: &[Span], remap: impl Fn(usize) -> usize) -> Vec<(Range<usize>, 
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root_name = self
             .repository
             .root
@@ -1400,7 +1452,7 @@ impl Render for ReviewView {
             if note_count == 1 { "" } else { "s" }
         );
         let diff_rows = selected_file
-            .map(|file| self.render_diff_rows(self.selected_file, file, cx))
+            .map(|file| self.render_diff_rows(self.selected_file, file, window, cx))
             .unwrap_or_default();
         let file_groups = self.render_file_groups(cx);
 
@@ -1412,78 +1464,84 @@ impl Render for ReviewView {
             .flex()
             .flex_col()
             // Room for the traffic lights, which sit at the sidebar's own inset.
-            .child(div().h(px(TITLEBAR_INSET)).flex_none())
+            .child(draggable(div().h(px(TITLEBAR_INSET)).flex_none()))
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .px(px(12.))
-                    .pb(px(10.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(ACCENT))
-                                    .child("⑂"),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg(0.92))
-                                    .child(root_name),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .font_family(MONO)
-                            .text_size(px(10.))
-                            .text_color(fg(0.34))
-                            .child(root_path),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(fg(0.5))
-                            .child(change_summary),
-                    ),
+                draggable(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.))
+                        .px(px(12.))
+                        .pb(px(10.)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(ACCENT))
+                                .child("⑂"),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ink())
+                                .child(root_name),
+                        ),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(MONO)
+                        .text_size(px(10.))
+                        .text_color(ink())
+                        .child(root_path),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(ink())
+                        .child(change_summary),
+                ),
             )
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(14.))
-                    .py(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg(0.76))
-                            .child("Changed Files"),
-                    )
-                    .child(
-                        div()
-                            .font_family(MONO)
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(fg(0.44))
-                            .child(file_count.to_string()),
-                    ),
+                draggable(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(14.))
+                        .py(px(8.)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ink())
+                        .child("Changed Files"),
+                )
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(ink())
+                        .child(file_count.to_string()),
+                ),
             )
             .child(
-                div()
+                // Chrome, so the gaps between and below the groups drag the
+                // window. The rows themselves opt out.
+                draggable(div())
                     .id("file-list")
                     .flex_1()
                     .min_h_0()
@@ -1495,8 +1553,7 @@ impl Render for ReviewView {
             .when_some(self.update.clone(), |element, version| {
                 let command = update::Install::detect().upgrade_hint();
                 element.child(
-                    div()
-                        .id("update-banner")
+                    holds_the_mouse(div().id("update-banner"))
                         .mx(px(8.))
                         .mb(px(2.))
                         .px(px(10.))
@@ -1522,13 +1579,13 @@ impl Render for ReviewView {
                             div()
                                 .font_family(MONO)
                                 .text_size(px(10.))
-                                .text_color(fg(0.45))
+                                .text_color(ink())
                                 .child(command),
                         ),
                 )
             })
             .child(
-                div()
+                draggable(div())
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1540,7 +1597,7 @@ impl Render for ReviewView {
                             .font_family(MONO)
                             .text_size(px(11.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg(0.3))
+                            .text_color(ink())
                             .child(format!("{note_count} ⌸")),
                     )
                     .child(div().flex_1())

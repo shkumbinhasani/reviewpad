@@ -4497,15 +4497,17 @@ dependencies = [
 
 [[package]]
 name = "reviewpad"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "gpui",
+ "objc",
  "resvg",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "smallvec",
  "tempfile",
  "tiny-skia",
  "tree-sitter",
@@ -4519,6 +4521,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "unicode-segmentation",
  "ureq",
  "usvg",
 ]

@@ -1,6 +1,6 @@
 [package]
 name = "reviewpad"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A local-first GPUI code review app and agent-friendly CLI"
 license = "MIT"
@@ -13,9 +13,11 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 gpui = "=0.2.2"
+objc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.10", default-features = false }
+smallvec = "1.15.2"
 tree-sitter = "0.26.12"
 tree-sitter-bash = "0.25.1"
 tree-sitter-css = "0.25.0"
@@ -27,7 +29,14 @@ tree-sitter-json = "0.24.8"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
+unicode-segmentation = "1.13.3"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls", "json", "gzip"] }
+
+# The objc macros expand with a `cargo-clippy` feature cfg, which this crate
+# does not declare. Naming it as expected silences the warning at its source
+# rather than blanket-allowing the lint.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
 # Rasterizing the app icon (examples/icon.rs). Same renderer gpui uses for SVGs.
