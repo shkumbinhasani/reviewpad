@@ -9,6 +9,8 @@ ReviewPad is a local-first Git review tool with one Rust binary and two interfac
 - a GPU-rendered desktop review panel built with [GPUI](https://www.gpui.rs/), the UI framework created for Zed;
 - an agent-friendly CLI that can block while a human reviews, then return the completed review as Markdown on stdout.
 
+![ReviewPad reviewing a TypeScript diff](assets/reviewpad-screenshot.png)
+
 It reads staged, unstaged, and untracked changes. Comments are anchored to old or new line numbers and stored in `.reviewpad/comments.json` at the repository root, where an agent can read them directly. That directory ignores itself, so review state never dirties the working tree it is inspecting. A review still living under the old `.git/reviewpad/` path is migrated forward the first time it is opened.
 
 ## Install
