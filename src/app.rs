@@ -1,11 +1,11 @@
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Entity, FocusHandle,
-    Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement, StyledText, Window, WindowBounds,
-    WindowOptions, canvas, div, img, list, point, prelude::*, px, relative, rgb, rgba, size, svg,
-    uniform_list,
+    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, CursorStyle, Entity,
+    FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions,
+    Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyledText, Window,
+    WindowBounds, WindowOptions, canvas, div, img, list, point, prelude::*, px, relative, rgb,
+    rgba, size, svg, uniform_list,
 };
 use std::{ops::Range, path::PathBuf, time::Duration};
 
@@ -42,6 +42,8 @@ const MARKER: f32 = 24.;
 const AVATAR: f32 = 24.;
 /// Height of a sidebar row. Fixed, so the list can virtualize.
 const SIDEBAR_ROW: f32 = 30.;
+/// Width of the notes column beside a render.
+const MEDIA_NOTES: f32 = 300.;
 const TAB_WIDTH: usize = 4;
 
 /// Git accent — the gold tgip uses for branch glyphs and dirty badges.
@@ -197,6 +199,26 @@ struct Target {
     line: usize,
 }
 
+/// A note's marker on the picture: where it points, and the frame it points at.
+struct Marker {
+    /// Position in the review, used when there is no frame to show.
+    number: usize,
+    id: String,
+    spot: Spot,
+    seconds: Option<f64>,
+    frame: Option<u32>,
+}
+
+/// Which divider is being dragged, while it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dragging {
+    Sidebar,
+    Notes,
+}
+
+/// What removing an attachment does.
+type Detach = Box<dyn Fn(&mut ReviewView, &mut Window, &mut Context<ReviewView>)>;
+
 /// One row of the diff, as a description rather than an element.
 ///
 /// The pane used to build every row of the selected file each frame — 7,086 of
@@ -222,6 +244,23 @@ enum SidebarRow {
     File(usize),
 }
 
+/// What a note is pinned to, carried on the message as an attachment.
+#[derive(Clone, Default)]
+struct Attachment {
+    /// The moment, as a timecode and the frame it lands on.
+    time: Option<String>,
+    /// The place, in the media's own pixels.
+    place: Option<String>,
+    /// The note to jump to when either is clicked.
+    jump: Option<String>,
+}
+
+impl Attachment {
+    fn is_empty(&self) -> bool {
+        self.time.is_none() && self.place.is_none()
+    }
+}
+
 /// One message to draw inside a thread — the root note or any of its replies.
 struct Message<'a> {
     /// Stable element key, distinct across every message on screen.
@@ -232,6 +271,8 @@ struct Message<'a> {
     id: &'a str,
     /// Anchor line, shown on the root only.
     meta: Option<String>,
+    /// Where it is pinned, shown on the root only.
+    attachment: Option<Attachment>,
     body: String,
 }
 
@@ -347,6 +388,12 @@ fn open_review_window(
                 player: None,
                 frame: None,
                 _pump: None,
+                noting_media: false,
+                noting_time: true,
+                media_size: None,
+                sidebar_width: SIDEBAR_WIDTH,
+                notes_width: MEDIA_NOTES,
+                dragging: None,
                 pending_spot: None,
                 media_bounds: None,
                 stage_bounds: None,
@@ -403,7 +450,19 @@ struct ReviewView {
     frame: Option<CVPixelBuffer>,
     /// Pulls frames and follows the player's clock.
     _pump: Option<gpui::Task<()>>,
-    /// A place the pointer put down, waiting for the comment to be written.
+    /// Whether a note is being written about the media on screen, and whether
+    /// the moment is still attached to it.
+    noting_media: bool,
+    noting_time: bool,
+    /// Natural size of the media, for saying a place in pixels rather than
+    /// percentages.
+    media_size: Option<(u32, u32)>,
+    /// Widths of the two panels, and which divider is under the pointer.
+    sidebar_width: f32,
+    notes_width: f32,
+    dragging: Option<Dragging>,
+    /// A place the pointer put down, if one was — the pin is an attachment to
+    /// the note, not a requirement for making one.
     pending_spot: Option<Spot>,
     /// Painted bounds of the image and the scrubber, which is what turns a
     /// click into a normalized spot or a time.
@@ -488,6 +547,16 @@ impl ReviewView {
             .rounded(px(6.))
             .overflow_hidden()
             .bg(tint(identity.color, 0.95))
+            // Lit the way the buttons are, so an author's tile belongs to the
+            // same surface rather than sitting flat on it.
+            .border_1()
+            .border_color(fg(0.14))
+            .shadow(vec![BoxShadow {
+                color: scrim(0.3),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(2.),
+                spread_radius: px(0.),
+            }])
             .flex()
             .items_center()
             .justify_center()
@@ -517,6 +586,17 @@ impl ReviewView {
                         .rounded(px(6.)),
                 )
             })
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(6.))
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(fg(0.2), 0.),
+                        gpui::linear_color_stop(fg(0.), 0.62),
+                    )),
+            )
     }
 
     /// Ask the release feed whether something newer exists. The request runs on
@@ -563,6 +643,9 @@ impl ReviewView {
     /// whether it is read as a diff or looked at.
     fn refresh_medium(&mut self, cx: &mut Context<Self>) {
         self.pending_spot = None;
+        self.noting_media = false;
+        self.noting_time = true;
+        self.media_size = None;
         self.time = 0.;
         self.probe = None;
         self.player = None;
@@ -574,6 +657,10 @@ impl ReviewView {
             return;
         };
         self.medium = Medium::of(&file.path);
+        if self.medium == Medium::Image {
+            // Read from the header; nothing is decoded.
+            self.media_size = image::image_dimensions(self.repository.root.join(&file.path)).ok();
+        }
         if self.medium != Medium::Video {
             return;
         }
@@ -624,6 +711,10 @@ impl ReviewView {
                     }
 
                     if arrived {
+                        if let Some(buffer) = frame.as_ref() {
+                            view.media_size =
+                                Some((buffer.get_width() as u32, buffer.get_height() as u32));
+                        }
                         view.frame = frame;
                     }
                     // Only follow the clock while it is running; otherwise the
@@ -863,6 +954,7 @@ impl ReviewView {
         self.anchor = None;
         self.reply_to = None;
         self.pending_spot = None;
+        self.noting_media = false;
         self.status = None;
         self.plan_diff();
         cx.notify();
@@ -906,32 +998,66 @@ impl ReviewView {
         cx.quit();
     }
 
-    /// tgip's `InspectorButton`: a translucent pill that brightens on hover.
+    /// A button with some weight to it.
+    ///
+    /// Flat fills read as labels rather than controls, so this layers what a
+    /// physical key does to light: a gradient sheen down the face that lifts on
+    /// hover, a hairline ring, and a soft shadow underneath to sit it above the
+    /// glass. The sheen is what makes the top edge read as lit — drawing that
+    /// edge as its own line looks like a line, which is what it is.
     fn button(
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
         primary: bool,
+        cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let _ = cx;
+        let (face, ring, text) = if primary {
+            (hex(ACCENT_FILL), tint(ACCENT, 0.45), tint(ACCENT, 0.98))
+        } else {
+            (fg(0.08), fg(0.14), ink())
+        };
+
         holds_the_mouse(div().id(id))
-            .px(px(13.))
-            .py(px(4.))
+            .group("button")
+            .relative()
+            .overflow_hidden()
+            .flex_none()
+            .h(px(30.))
+            .px(px(12.))
             .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(face)
+            .border_1()
+            .border_color(ring)
+            .shadow(vec![BoxShadow {
+                color: scrim(0.28),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(3.),
+                spread_radius: px(0.),
+            }])
             .text_size(px(12.))
             .font_weight(FontWeight::MEDIUM)
-            .text_color(if primary { tint(ACCENT, 0.96) } else { ink() })
-            .bg(if primary { hex(ACCENT_FILL) } else { fg(0.06) })
-            .border_1()
-            .border_color(if primary { tint(ACCENT, 0.22) } else { fg(0.) })
+            .text_color(text)
             .cursor_pointer()
-            .hover(|style| {
-                style.bg(if primary {
-                    tint(0x6b3f14, 0.92)
-                } else {
-                    fg(0.12)
-                })
-            })
-            .active(|style| style.opacity(0.7))
+            // The sheen, brightening under the pointer.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .bg(gpui::linear_gradient(
+                        180.,
+                        gpui::linear_color_stop(fg(0.22), 0.),
+                        gpui::linear_color_stop(fg(0.), 0.62),
+                    ))
+                    .opacity(0.5)
+                    .group_hover("button", |style| style.opacity(1.)),
+            )
             .child(label.into())
+            .active(|style| style.opacity(0.82))
     }
 
     /// A hairline rule — tgip leans on `Divider().opacity(...)` throughout.
@@ -1221,6 +1347,7 @@ impl ReviewView {
             author,
             id,
             meta,
+            attachment,
             body,
         } = message;
         let remove_id = id.to_string();
@@ -1315,6 +1442,69 @@ impl ReviewView {
                     .text_color(fg(0.84))
                     .child(body),
             )
+            .when_some(
+                attachment.filter(|attachment| !attachment.is_empty()),
+                |element, attachment| {
+                    // The moment and the place are separate tags, each its own
+                    // way back to what the note points at.
+                    let (time, place) = (attachment.time, attachment.place);
+                    let (to_time, to_place) = (attachment.jump.clone(), attachment.jump);
+                    element.child(
+                        div()
+                            .mt(px(2.))
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.))
+                            .when_some(time, |element, label| {
+                                element.child(
+                                    holds_the_mouse(div().id(("tag-time", key)))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(7.))
+                                        .py(px(2.))
+                                        .rounded_full()
+                                        .bg(hex(ACCENT_FILL))
+                                        .border_1()
+                                        .border_color(tint(ACCENT, 0.3))
+                                        .font_family(MONO)
+                                        .text_size(px(10.))
+                                        .text_color(tint(ACCENT, 0.95))
+                                        .cursor_pointer()
+                                        .hover(|style| style.border_color(tint(ACCENT, 0.7)))
+                                        .when_some(to_time, |element, jump| {
+                                            element.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.jump_to(jump.clone(), cx)
+                                            }))
+                                        })
+                                        .child(label),
+                                )
+                            })
+                            .when_some(place, |element, label| {
+                                element.child(
+                                    holds_the_mouse(div().id(("tag-place", key)))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(7.))
+                                        .py(px(2.))
+                                        .rounded_full()
+                                        .bg(fg(0.08))
+                                        .font_family(MONO)
+                                        .text_size(px(10.))
+                                        .text_color(ink())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(fg(0.14)))
+                                        .when_some(to_place, |element, jump| {
+                                            element.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.jump_to(jump.clone(), cx)
+                                            }))
+                                        })
+                                        .child(label),
+                                )
+                            }),
+                    )
+                },
+            )
     }
 
     /// A thread: the anchored note and everything it started, indented to the
@@ -1323,7 +1513,7 @@ impl ReviewView {
         &self,
         index: usize,
         comment: ReviewComment,
-        gutter: Pixels,
+        indent: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let group = format!("thread-{index}");
@@ -1344,6 +1534,7 @@ impl ReviewView {
                             author: &reply.author,
                             id: &reply.id,
                             meta: None,
+                            attachment: None,
                             body: reply.body.clone(),
                         },
                         cx,
@@ -1357,7 +1548,23 @@ impl ReviewView {
                 group: &group,
                 author: &comment.author,
                 id: &comment.id,
-                meta: Some(comment.anchor.label()),
+                meta: match comment.anchor {
+                    Anchor::Line { .. } | Anchor::File => Some(comment.anchor.label()),
+                    _ => None,
+                },
+                attachment: Some(Attachment {
+                    time: match comment.anchor {
+                        Anchor::Time {
+                            seconds,
+                            frame: Some(frame),
+                            ..
+                        } => Some(format!("{} f{frame}", media::timecode(seconds.0))),
+                        Anchor::Time { seconds, .. } => Some(media::timecode(seconds.0)),
+                        _ => None,
+                    },
+                    place: comment.anchor.spot().map(|spot| self.spot_label(spot)),
+                    jump: Some(comment.id.clone()),
+                }),
                 body: comment.body.clone(),
             },
             cx,
@@ -1366,7 +1573,7 @@ impl ReviewView {
         div()
             .id(("inline-comment", index))
             .group(group)
-            .pl(gutter + gutter + px(MARKER))
+            .pl(indent)
             .pr(px(18.))
             .py(px(6.))
             .bg(fg(0.02))
@@ -1386,7 +1593,7 @@ impl ReviewView {
     fn render_inline_composer(
         &self,
         line: Option<&DiffLine>,
-        gutter: Pixels,
+        indent: Pixels,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1397,20 +1604,12 @@ impl ReviewView {
             (None, Some((side, number))) => {
                 format!("New comment · line {number} · {}", side.label())
             }
-            (None, None) => match (self.pending_spot, self.medium) {
-                (Some(spot), Medium::Video) => format!(
-                    "New comment · {} · {}",
-                    media::timecode(self.time),
-                    spot.label()
-                ),
-                (Some(spot), _) => format!("New comment · {}", spot.label()),
-                _ => "New comment".to_string(),
-            },
+            (None, None) => "New comment".to_string(),
         };
 
         div()
             .id("composer")
-            .pl(gutter + gutter + px(MARKER))
+            .pl(indent)
             .pr(px(18.))
             // A reply tucks under the thread it answers; a new comment stands
             // on its own beneath the line.
@@ -1437,17 +1636,21 @@ impl ReviewView {
                                     .child(heading),
                             )
                             .child(
-                                div()
-                                    .id("cancel-inline")
-                                    .px(px(8.))
-                                    .py(px(2.))
-                                    .rounded_full()
-                                    .text_size(px(11.))
-                                    .text_color(ink())
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(fg(0.08)).text_color(fg(0.9)))
-                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_comment(cx)))
-                                    .child("Cancel"),
+                                div().flex().items_center().gap(px(2.)).child(
+                                    div()
+                                        .id("cancel-inline")
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded_full()
+                                        .text_size(px(11.))
+                                        .text_color(ink())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(fg(0.08)).text_color(fg(0.9)))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_comment(cx)),
+                                        )
+                                        .child("Cancel"),
+                                ),
                             ),
                     )
                     .child(
@@ -1465,6 +1668,47 @@ impl ReviewView {
                             .bg(scrim(0.28))
                             .child(self.draft.clone()),
                     )
+                    .when(self.noting_media, |element| {
+                        // Two attachments, each coming off on its own: the
+                        // moment, and the place.
+                        let time = self.time_label();
+                        let place = self.pending_spot.map(|spot| self.spot_label(spot));
+                        element.child(
+                            div()
+                                .mt(px(8.))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(6.))
+                                .when_some(time.filter(|_| self.noting_time), |element, label| {
+                                    element.child(Self::render_tag(
+                                        "tag-time",
+                                        label,
+                                        Some(Box::new(|this, _window, cx| {
+                                            this.noting_time = false;
+                                            cx.notify();
+                                        })),
+                                        cx,
+                                    ))
+                                })
+                                .when_some(place, |element, label| {
+                                    element.child(Self::render_tag(
+                                        "tag-place",
+                                        label,
+                                        Some(Box::new(|this, _window, cx| this.clear_spot(cx))),
+                                        cx,
+                                    ))
+                                })
+                                .when(self.pending_spot.is_none(), |element| {
+                                    element.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(fg(0.4))
+                                            .child("click the picture to attach a place"),
+                                    )
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .mt(px(8.))
@@ -1483,6 +1727,7 @@ impl ReviewView {
                                     "add-inline",
                                     if replying { "Reply" } else { "Add comment" },
                                     true,
+                                    cx,
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.add_comment(cx))),
                             ),
@@ -1564,12 +1809,12 @@ impl ReviewView {
             },
             DiffRow::Thread(position) => match self.review.comments.get(position) {
                 Some(comment) => self
-                    .render_inline_comment(position, comment.clone(), gutter, cx)
+                    .render_inline_comment(position, comment.clone(), code_indent(gutter), cx)
                     .into_any_element(),
                 None => div().into_any_element(),
             },
             DiffRow::Composer(line) => self
-                .render_inline_composer(file.lines.get(line), gutter, window, cx)
+                .render_inline_composer(file.lines.get(line), code_indent(gutter), window, cx)
                 .into_any_element(),
         }
     }
@@ -1637,6 +1882,8 @@ impl ReviewView {
             x: (f32::from(local.x) / f32::from(bounds.size.width)).clamp(0., 1.),
             y: (f32::from(local.y) / f32::from(bounds.size.height)).clamp(0., 1.),
         });
+        self.noting_media = true;
+        self.noting_time = true;
         self.anchor = None;
         self.reply_to = None;
         self.status = None;
@@ -1647,9 +1894,105 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// Take the player to the moment a note was left at, selecting its file
+    /// first if the note is on a different one.
+    ///
+    /// Without this a video review is one-way: notes go in at a moment and
+    /// nothing brings you back to it.
+    fn jump_to(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(comment) = self.review.find(&id) else {
+            return;
+        };
+        let (path, seconds, spot) = (
+            comment.path.clone(),
+            comment.anchor.seconds(),
+            comment.anchor.spot(),
+        );
+
+        if self
+            .diff
+            .files
+            .get(self.selected_file)
+            .map(|file| &file.path)
+            != Some(&path)
+        {
+            let Some(index) = self.diff.files.iter().position(|file| file.path == path) else {
+                return;
+            };
+            self.select_file(index, cx);
+        }
+
+        if let Some(seconds) = seconds {
+            self.seek(seconds, cx);
+        }
+        // Show which note is being looked at while the picture catches up.
+        self.status = spot.map(|spot| format!("{id} · {}", spot.label()));
+        cx.notify();
+    }
+
+    /// A divider between panels. Dragging it resizes the panel beside it.
+    fn render_divider(&self, which: Dragging, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let id = match which {
+            Dragging::Sidebar => "divide-sidebar",
+            Dragging::Notes => "divide-notes",
+        };
+        holds_the_mouse(div().id(id))
+            .flex_none()
+            .w(px(6.))
+            .h_full()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .hover(|style| style.bg(tint(ACCENT, 0.35)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.dragging = Some(which);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Follow the pointer while a divider is held.
+    fn drag_divider(&mut self, x: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let Some(dragging) = self.dragging else {
+            return;
+        };
+        let x = f32::from(x);
+        match dragging {
+            Dragging::Sidebar => {
+                self.sidebar_width = (x - OUTER_PADDING).clamp(190., 520.);
+            }
+            Dragging::Notes => {
+                let width = f32::from(window.viewport_size().width);
+                self.notes_width = (width - x - OUTER_PADDING).clamp(220., 620.);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Start a note about the media without pointing at anything in it.
+    fn start_media_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.noting_media = true;
+        self.noting_time = true;
+        self.pending_spot = None;
+        self.anchor = None;
+        self.reply_to = None;
+        self.status = None;
+        self.draft.update(cx, |draft, cx| {
+            draft.set_placeholder("Write a review comment…", cx);
+        });
+        self.draft.read(cx).focus(window);
+        cx.notify();
+    }
+
+    /// Drop the pin from the note being written, leaving the note itself.
+    fn clear_spot(&mut self, cx: &mut Context<Self>) {
+        self.pending_spot = None;
+        cx.notify();
+    }
+
     /// Comments already on the thing being looked at, in review order so the
     /// pins carry the same numbers as the exported brief.
-    fn spots_here(&self, path: &str) -> Vec<(usize, String, Spot)> {
+    fn spots_here(&self, path: &str) -> Vec<Marker> {
         self.review
             .comments
             .iter()
@@ -1657,47 +2000,133 @@ impl ReviewView {
             .filter(|(_, comment)| comment.path == path)
             .filter_map(|(index, comment)| {
                 let spot = comment.anchor.spot()?;
-                // On a video, only pins for the moment on screen.
+                // On a video, only markers for the moment on screen.
                 if let Some(seconds) = comment.anchor.seconds()
                     && (seconds - self.time).abs() > 0.25
                 {
                     return None;
                 }
-                Some((index + 1, comment.id.clone(), spot))
+                Some(Marker {
+                    number: index + 1,
+                    id: comment.id.clone(),
+                    spot,
+                    seconds: comment.anchor.seconds(),
+                    frame: match comment.anchor {
+                        Anchor::Time { frame, .. } => frame,
+                        _ => None,
+                    },
+                })
             })
             .collect()
     }
 
-    /// A numbered pin over an image or frame.
-    fn render_pin(number: usize, id: &str, spot: Spot, pending: bool) -> gpui::Div {
-        div()
-            .absolute()
-            .left(relative(spot.x))
-            .top(relative(spot.y))
-            // Centre the pin on the point rather than hanging it off the corner.
-            .ml(px(-11.))
-            .mt(px(-11.))
-            .size(px(22.))
+    /// A chip marking a place on the picture.
+    ///
+    /// It carries the frame it sits on rather than the note's number, because
+    /// on a video that is the useful fact: a composition is edited by frame, so
+    /// the marker says both where and when.
+    /// One attachment on a note: a moment, or a place. Each is its own chip and
+    /// each comes off on its own — a note can be pinned to both, either, or
+    /// neither.
+    fn render_tag(
+        id: impl Into<gpui::ElementId>,
+        label: String,
+        remove: Option<Detach>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        holds_the_mouse(div().id(id))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.))
+            .px(px(7.))
+            .py(px(2.))
             .rounded_full()
+            .bg(hex(ACCENT_FILL))
+            .border_1()
+            .border_color(tint(ACCENT, 0.3))
+            .font_family(MONO)
+            .text_size(px(10.))
+            .text_color(tint(ACCENT, 0.95))
+            .child(label)
+            .when_some(remove, |element, remove| {
+                element.child(
+                    div()
+                        .id("remove-tag")
+                        .text_color(fg(0.5))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(hex(DEL_MARK)))
+                        .on_click(cx.listener(move |this, _, window, cx| remove(this, window, cx)))
+                        .child("×"),
+                )
+            })
+    }
+
+    /// The moment chip: the timecode a person reads and the frame a composition
+    /// is edited by, in one tag.
+    fn time_label(&self) -> Option<String> {
+        (self.medium == Medium::Video).then(|| match self.probe {
+            Some(probe) => format!(
+                "{} f{}",
+                media::timecode(self.time),
+                probe.frame_at(self.time)
+            ),
+            None => media::timecode(self.time),
+        })
+    }
+
+    /// The place chip, in the media's own pixels rather than a fraction.
+    fn spot_label(&self, spot: Spot) -> String {
+        match self.media_size {
+            Some((width, height)) => format!(
+                "{}px:{}px",
+                (spot.x * width as f32).round() as u32,
+                (spot.y * height as f32).round() as u32
+            ),
+            None => spot.label(),
+        }
+    }
+
+    fn render_chip(
+        &self,
+        marker: &Marker,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let target = marker.id.clone();
+        let label = match (marker.seconds, marker.frame) {
+            (Some(seconds), Some(frame)) => format!("{} f{frame}", media::timecode(seconds)),
+            (Some(seconds), None) => media::timecode(seconds),
+            _ => marker.number.to_string(),
+        };
+
+        holds_the_mouse(div().id(("chip", marker.number)))
+            .absolute()
+            .left(relative(marker.spot.x))
+            .top(relative(marker.spot.y))
+            // Anchored at its left edge on the point, sitting just above it.
+            .ml(px(-6.))
+            .mt(px(-13.))
             .flex()
             .items_center()
-            .justify_center()
-            .bg(if pending {
-                fg(0.92)
-            } else {
-                rgb(ACCENT).into()
-            })
+            .px(px(7.))
+            .py(px(2.))
+            .rounded_full()
+            .bg(rgb(ACCENT))
             .border_2()
             .border_color(scrim(0.55))
-            .text_size(px(11.))
+            .font_family(MONO)
+            .text_size(px(10.))
             .font_weight(FontWeight::BOLD)
-            .text_color(scrim(0.8))
-            .child(if pending {
-                "＋".to_string()
-            } else {
-                let _ = id;
-                number.to_string()
+            .text_color(scrim(0.82))
+            .when(pending, |element| element.opacity(0.85))
+            .when(!pending, |element| {
+                element
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(fg(0.9)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to(target.clone(), cx)))
             })
+            .child(label)
     }
 
     /// The pane for something that is looked at rather than read: an image, or
@@ -1726,50 +2155,67 @@ impl ReviewView {
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
-            .flex_col()
+            .flex_row()
             .child(
                 div()
-                    .id("media-stage")
-                    .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(px(18.))
-                    // Stretched over the stage: a canvas sizes to its content,
-                    // which is nothing, and a zero-size rect would scale the
-                    // video down to nothing with it.
+                    .flex_col()
                     .child(
-                        canvas(
-                            {
-                                let view = cx.entity();
-                                move |bounds, _, cx| {
-                                    view.update(cx, |view, _| view.stage_bounds = Some(bounds));
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    .map(|element| {
-                        let Some(surface_element) =
-                            self.render_surface(still, frame, video_rect, spots, pending, cx)
-                        else {
-                            return element.child(Self::empty_state(
+                        div()
+                            .id("media-stage")
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(18.))
+                            // Stretched over the stage: a canvas sizes to its content,
+                            // which is nothing, and a zero-size rect would scale the
+                            // video down to nothing with it.
+                            .child(
+                                canvas(
+                                    {
+                                        let view = cx.entity();
+                                        move |bounds, _, cx| {
+                                            view.update(cx, |view, _| {
+                                                view.stage_bounds = Some(bounds)
+                                            });
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                            .map(|element| {
+                                let Some(surface_element) = self
+                                    .render_surface(still, frame, video_rect, spots, pending, cx)
+                                else {
+                                    return element.child(Self::empty_state(
                                 "Opening the clip",
                                 "AVFoundation is loading it. If this never finishes, the file \
                                  may not be a format macOS can decode.",
                             ));
-                        };
-                        element.child(surface_element)
+                                };
+                                element.child(surface_element)
+                            }),
+                    )
+                    .when(self.medium == Medium::Video, |element| {
+                        element.child(self.render_timeline(cx))
                     }),
             )
-            .when(self.medium == Medium::Video, |element| {
-                element.child(self.render_timeline(cx))
+            // Notes beside the picture rather than under it: a video pane is
+            // wide and short, so the room is at the side.
+            .when(self.has_notes(&path), |element| {
+                element.child(self.render_divider(Dragging::Notes, cx))
             })
+            .children(self.render_media_threads(&path, cx))
     }
 
     /// The picture: a decoded frame at its fitted rect, or a still image that
@@ -1781,21 +2227,50 @@ impl ReviewView {
         still: Option<PathBuf>,
         frame: Option<CVPixelBuffer>,
         video_rect: Option<Bounds<Pixels>>,
-        spots: Vec<(usize, String, Spot)>,
+        spots: Vec<Marker>,
         pending: Option<Spot>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let stage = self.stage_bounds;
-        let body = div()
-            .id("media-surface")
-            .relative()
-            .cursor_crosshair()
-            .children(
-                spots
-                    .into_iter()
-                    .map(|(number, id, spot)| Self::render_pin(number, &id, spot, false))
-                    .chain(pending.map(|spot| Self::render_pin(0, "", spot, true))),
-            )
+
+        // The picture goes down first. Primitives are ordered by the sequence
+        // they are painted in, so anything added before it ends up underneath —
+        // which is where the pins were.
+        let mut body = div().id("media-surface").relative().cursor_crosshair();
+        body = match (&frame, &still) {
+            (Some(frame), _) => body.child(surface(frame.clone()).size_full()),
+            (_, Some(still)) => body.child(img(still.clone()).max_w_full().max_h_full()),
+            _ => return None,
+        };
+
+        let body = body
+            .children({
+                // Built eagerly: two closures cannot both borrow the context.
+                let mut chips: Vec<_> = spots
+                    .iter()
+                    .map(|marker| self.render_chip(marker, false, cx))
+                    .collect();
+                if let Some(spot) = pending {
+                    // The chip about to be committed shows the frame it will
+                    // carry, so the label does not change on saving.
+                    chips.push(
+                        self.render_chip(
+                            &Marker {
+                                number: 0,
+                                id: String::new(),
+                                spot,
+                                seconds: (self.medium == Medium::Video).then_some(self.time),
+                                frame: (self.medium == Medium::Video)
+                                    .then(|| self.probe.map(|probe| probe.frame_at(self.time)))
+                                    .flatten(),
+                            },
+                            true,
+                            cx,
+                        ),
+                    );
+                }
+                chips
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1819,24 +2294,96 @@ impl ReviewView {
             );
 
         match (frame, still) {
-            (Some(frame), _) => {
+            // A decoded frame has no intrinsic size, so it is placed at the
+            // rect computed for it; an image sizes itself.
+            (Some(_), _) => {
                 let (rect, stage) = (video_rect?, stage?);
                 Some(
                     body.absolute()
                         .left(rect.origin.x - stage.origin.x)
                         .top(rect.origin.y - stage.origin.y)
                         .w(rect.size.width)
-                        .h(rect.size.height)
-                        .child(surface(frame).size_full()),
+                        .h(rect.size.height),
                 )
             }
-            (_, Some(still)) => Some(
-                body.max_w_full()
-                    .max_h_full()
-                    .child(img(still).max_w_full().max_h_full()),
-            ),
+            (_, Some(_)) => Some(body.max_w_full().max_h_full()),
             _ => None,
         }
+    }
+
+    fn has_notes(&self, path: &str) -> bool {
+        self.review.comments.iter().any(|c| c.path == path) || self.medium != Medium::Text
+    }
+
+    /// The notes left on this render, newest last, each one a way back to the
+    /// moment or place it was left at.
+    fn render_media_threads(
+        &self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let threads: Vec<(usize, ReviewComment)> = self
+            .review
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, comment)| comment.path == path)
+            .map(|(index, comment)| (index, comment.clone()))
+            .collect();
+
+        let heading = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(10.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ink())
+                    .child(match threads.len() {
+                        0 => "No notes yet".to_string(),
+                        1 => "1 note".to_string(),
+                        count => format!("{count} notes"),
+                    }),
+            )
+            .child(
+                Self::button("add-media-note", "Add note", false, cx)
+                    .on_click(cx.listener(|this, _, window, cx| this.start_media_note(window, cx))),
+            );
+
+        Some(
+            div()
+                .id("media-threads")
+                .flex_none()
+                .w(px(self.notes_width))
+                .h_full()
+                .overflow_y_scroll()
+                .border_l_1()
+                .border_color(fg(0.08))
+                .child(heading)
+                .when(threads.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .px(px(12.))
+                            .text_size(px(11.))
+                            .line_height(px(17.))
+                            .text_color(fg(0.45))
+                            .child(
+                                "Click the picture to mark a place in it, or add a note \
+                                 about the moment or the render as a whole.",
+                            ),
+                    )
+                })
+                .children(threads.into_iter().map(|(index, comment)| {
+                    // The anchor rides on the message as an attachment, so
+                    // nothing sits above the card.
+                    self.render_inline_comment(index, comment, px(12.), cx)
+                })),
+        )
     }
 
     /// The scrubber. Clicking it seeks; the ticks are the moments already
@@ -2042,6 +2589,12 @@ fn gutter_width(file: &FileDiff) -> Pixels {
     px((digits * 8. + 13.).max(GUTTER))
 }
 
+/// Where a thread hangs in a diff: level with the code, past both gutters and
+/// the marker column.
+fn code_indent(gutter: Pixels) -> Pixels {
+    gutter + gutter + px(MARKER)
+}
+
 /// The largest rect of a given aspect that fits inside `stage`, centred.
 fn fit(stage: Bounds<Pixels>, width: f32, height: f32) -> Bounds<Pixels> {
     if width <= 0. || height <= 0. {
@@ -2147,7 +2700,7 @@ impl Render for ReviewView {
         // Sidebar — part of the window itself, painted straight onto the glass
         // with no panel fill or divider, exactly like tgip's.
         let sidebar = div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .flex_none()
             .flex()
             .flex_col()
@@ -2299,11 +2852,11 @@ impl Render for ReviewView {
                     )
                     .child(div().flex_1())
                     .child(
-                        Self::button("copy", "Copy Markdown", false)
+                        Self::button("copy", "Copy Markdown", false, cx)
                             .on_click(cx.listener(|this, _, _, cx| this.copy_markdown(cx))),
                     )
                     .child(
-                        Self::button("finish", "Finish", true)
+                        Self::button("finish", "Finish", true, cx)
                             .on_click(cx.listener(|this, _, window, cx| this.finish(window, cx))),
                     ),
             );
@@ -2427,14 +2980,29 @@ impl Render for ReviewView {
                 ),
                 (_, Some(file)) => element
                     .child(self.render_media(file, cx))
-                    .when(self.pending_spot.is_some(), |element| {
-                        element.child(self.render_inline_composer(None, px(0.), window, cx))
+                    .when(self.noting_media, |element| {
+                        element.child(self.render_inline_composer(None, px(12.), window, cx))
                     }),
             });
 
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key))
+            // Tracked at the root so the pointer can leave the divider without
+            // dropping the drag.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.dragging.is_some() {
+                    this.drag_divider(event.position.x, window, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .p(px(OUTER_PADDING))
@@ -2446,6 +3014,7 @@ impl Render for ReviewView {
             .text_color(fg(0.9))
             .text_sm()
             .child(sidebar)
+            .child(self.render_divider(Dragging::Sidebar, cx))
             .child(card)
     }
 }

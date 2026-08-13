@@ -322,10 +322,8 @@ fn comment(placement: Placement) -> Result<()> {
             )
         }
         (None, None, Some(spot)) => (Anchor::Spot { spot }, String::new()),
-        (None, None, None) => bail!(
-            "say where the note goes: a line number for text, --time for video, \
-             --spot for an image"
-        ),
+        // Nothing pointed at: a note about the file itself.
+        (None, None, None) => (Anchor::File, String::new()),
         _ => bail!("--time, --spot and a line number are alternatives, not a combination"),
     };
 

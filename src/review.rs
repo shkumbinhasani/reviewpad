@@ -72,6 +72,9 @@ pub enum Anchor {
     },
     /// A place on an image.
     Spot { spot: Spot },
+    /// The file itself, with nothing pointed at inside it. A note about a
+    /// render as a whole, or about a file rather than a line.
+    File,
 }
 
 /// `f64` that can sit inside an `Eq` type. Times are only ever compared for
@@ -102,6 +105,7 @@ impl Anchor {
                 label
             }
             Anchor::Spot { spot } => spot.label(),
+            Anchor::File => "the file".to_string(),
         }
     }
 
@@ -124,7 +128,7 @@ impl Anchor {
         match self {
             Anchor::Spot { spot } => Some(*spot),
             Anchor::Time { spot, .. } => *spot,
-            Anchor::Line { .. } => None,
+            Anchor::Line { .. } | Anchor::File => None,
         }
     }
 }
@@ -568,6 +572,35 @@ mod tests {
         assert!(text.contains("42%,31%"));
         assert!(text.contains("50%,20%"));
         assert!(text.contains("out/video.mp4"));
+    }
+
+    /// A note does not have to point at anything inside the file.
+    #[test]
+    fn a_file_anchor_carries_no_place() {
+        let mut review = Review::default();
+        review.add_comment(
+            "out/promo.mp4",
+            Anchor::File,
+            "reviewer",
+            "The whole thing feels rushed.",
+            "",
+        );
+        assert_eq!(review.comments[0].anchor.spot(), None);
+        assert_eq!(review.comments[0].anchor.seconds(), None);
+        assert!(review.markdown(Path::new("/tmp")).contains("the file"));
+    }
+
+    #[test]
+    fn a_moment_can_be_noted_without_a_place() {
+        let anchor = Anchor::Time {
+            seconds: OrderedF64(12.5),
+            frame: Some(375),
+            spot: None,
+        };
+        assert_eq!(anchor.spot(), None);
+        assert_eq!(anchor.seconds(), Some(12.5));
+        // The pin is an attachment; without one the moment still reads.
+        assert_eq!(anchor.label(), "0:12.500 · frame 375");
     }
 
     #[test]
