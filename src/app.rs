@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use reviewpad::{
     git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
-    review::{Review, ReviewComment},
+    review::{Review, ReviewComment, thread_of},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
     update,
 };
@@ -61,6 +61,10 @@ const TINT_ADDED: u32 = 0x6bdb8f;
 const TINT_DELETED: u32 = 0xff806b;
 const TINT_MODIFIED: u32 = 0x7abdff;
 
+/// Signature on notes written in the app, so a thread shows who said what when
+/// an agent replies from the CLI with `--author`.
+const AUTHOR: &str = "you";
+
 /// Explicit installed coding face. `SF Mono` is not exposed under that family
 /// name on every Mac, which made CoreText silently fall back to an ugly face.
 const MONO: &str = "JetBrainsMono Nerd Font Mono";
@@ -103,8 +107,7 @@ struct Anchor {
 }
 
 pub fn run(repository: Repository, diff: DiffSet, print_on_finish: bool) -> Result<()> {
-    let review_path = repository.review_path();
-    let review = Review::load(&review_path)?;
+    let review = Review::open(&repository)?;
 
     Application::new().run(move |cx: &mut App| {
         open_review_window(cx, repository, diff, review, print_on_finish);
@@ -132,7 +135,7 @@ pub fn pick_and_run() -> Result<()> {
                 .and_then(|repository| repository.diff().map(|diff| (repository, diff)))
             {
                 Ok((repository, diff)) => {
-                    let review = Review::load(&repository.review_path()).unwrap_or_default();
+                    let review = Review::open(&repository).unwrap_or_default();
                     let _ = cx.update(|cx| {
                         open_review_window(cx, repository, diff, review, false);
                     });
@@ -187,6 +190,7 @@ fn open_review_window(
                 review,
                 selected_file: 0,
                 anchor: None,
+                reply_to: None,
                 draft: String::new(),
                 focus: cx.focus_handle(),
                 print_on_finish,
@@ -213,6 +217,9 @@ struct ReviewView {
     review: Review,
     selected_file: usize,
     anchor: Option<Anchor>,
+    /// Id of the thread the composer is answering, when it is not anchored to a
+    /// diff line.
+    reply_to: Option<String>,
     draft: String,
     focus: FocusHandle,
     print_on_finish: bool,
@@ -235,6 +242,7 @@ impl ReviewView {
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
         self.selected_file = index;
         self.anchor = None;
+        self.reply_to = None;
         self.draft.clear();
         self.refresh_highlight();
         cx.notify();
@@ -275,6 +283,7 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) {
         self.anchor = Some(Anchor { file, line });
+        self.reply_to = None;
         self.status = None;
         window.focus(&self.focus);
         cx.notify();
@@ -294,7 +303,7 @@ impl ReviewView {
     fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        let composing = self.anchor.is_some();
+        let composing = self.anchor.is_some() || self.reply_to.is_some();
 
         match key {
             // Outside the composer the arrows walk the file list, so the diff
@@ -335,17 +344,31 @@ impl ReviewView {
     }
 
     fn add_comment(&mut self, cx: &mut Context<Self>) {
-        let Some(anchor) = self.anchor.clone() else {
-            self.status = Some("Select a diff line first".into());
-            cx.notify();
-            return;
-        };
-        let body = self.draft.trim();
+        let body = self.draft.trim().to_string();
         if body.is_empty() {
             self.status = Some("Write a comment first".into());
             cx.notify();
             return;
         }
+
+        // Answering an existing note continues its thread; otherwise the draft
+        // opens a new one on the selected line.
+        if let Some(target) = self.reply_to.clone() {
+            match self.review.add_reply(&target, AUTHOR, body) {
+                Ok(_) => self.finish_composing("Reply saved", cx),
+                Err(error) => {
+                    self.status = Some(format!("{error}"));
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        let Some(anchor) = self.anchor.clone() else {
+            self.status = Some("Select a diff line first".into());
+            cx.notify();
+            return;
+        };
         let Some(file) = self.diff.files.get(anchor.file) else {
             return;
         };
@@ -357,43 +380,55 @@ impl ReviewView {
             cx.notify();
             return;
         };
-        let start = anchor.line.saturating_sub(2);
-        let end = (anchor.line + 3).min(file.lines.len());
-        let context = file.lines[start..end]
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.review.comments.push(ReviewComment {
-            path: file.path.clone(),
-            side,
-            line: number,
-            body: body.to_string(),
-            context,
-        });
+
+        let context = file.context_at(anchor.line);
+        let path = file.path.clone();
+        self.review
+            .add_comment(path, side, number, AUTHOR, body, context);
+        self.finish_composing("Comment saved", cx);
+    }
+
+    /// Clear the composer and persist, reporting whichever outcome the save had.
+    fn finish_composing(&mut self, saved: &str, cx: &mut Context<Self>) {
         self.draft.clear();
         self.anchor = None;
+        self.reply_to = None;
         self.status = match self.review.save(&self.repository.review_path()) {
-            Ok(()) => Some("Comment saved".into()),
+            Ok(()) => Some(saved.into()),
             Err(error) => Some(format!("Could not save: {error}")),
         };
         cx.notify();
     }
 
-    fn delete_comment(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.review.comments.len() {
-            self.review.comments.remove(index);
-            self.status = match self.review.save(&self.repository.review_path()) {
-                Ok(()) => Some("Comment removed".into()),
-                Err(error) => Some(format!("Could not save: {error}")),
-            };
-            cx.notify();
+    fn delete_comment(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.review.remove(&id).is_err() {
+            return;
         }
+        if self.reply_to.as_deref() == Some(id.as_str()) {
+            self.reply_to = None;
+            self.draft.clear();
+        }
+        self.status = match self.review.save(&self.repository.review_path()) {
+            Ok(()) => Some("Comment removed".into()),
+            Err(error) => Some(format!("Could not save: {error}")),
+        };
+        cx.notify();
+    }
+
+    /// Aim the composer at a thread instead of a diff line.
+    fn start_reply(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.reply_to = Some(id);
+        self.anchor = None;
+        self.draft.clear();
+        self.status = None;
+        window.focus(&self.focus);
+        cx.notify();
     }
 
     fn cancel_comment(&mut self, cx: &mut Context<Self>) {
         self.draft.clear();
         self.anchor = None;
+        self.reply_to = None;
         self.status = None;
         cx.notify();
     }
@@ -412,12 +447,8 @@ impl ReviewView {
         cx.write_to_clipboard(ClipboardItem::new_string(markdown));
         self.status = Some(format!(
             "Copied {} comment{} as Markdown",
-            self.review.comments.len(),
-            if self.review.comments.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
+            self.review.len(),
+            if self.review.len() == 1 { "" } else { "s" }
         ));
         cx.notify();
     }
@@ -732,12 +763,78 @@ impl ReviewView {
             })
     }
 
+    /// A thread: the anchored note, then its replies, each labelled with the id
+    /// an agent would pass to `reviewpad reply`.
     fn render_inline_comment(
         &self,
         index: usize,
         comment: ReviewComment,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let id = comment.id.clone();
+        let replies = comment
+            .replies
+            .iter()
+            .enumerate()
+            .map(|(position, reply)| {
+                let reply_id = reply.id.clone();
+                div()
+                    .id(("reply", index * 64 + position))
+                    .mt(px(8.))
+                    .pt(px(8.))
+                    .border_t_1()
+                    .border_color(fg(0.08))
+                    .child(
+                        div()
+                            .mb(px(3.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(fg(0.72))
+                                            .child(reply.author.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(MONO)
+                                            .text_size(px(10.))
+                                            .text_color(fg(0.34))
+                                            .child(reply.id.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("remove-reply", index * 64 + position))
+                                    .px_2()
+                                    .text_color(fg(0.34))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(hex(DEL_MARK)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.delete_comment(reply_id.clone(), cx)
+                                    }))
+                                    .child("Remove"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_color(fg(0.85))
+                            .child(reply.body.clone()),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let remove_id = id.clone();
+        let reply_id = id.clone();
+
         div()
             .id(("inline-comment", index))
             .pl(px(112.))
@@ -757,28 +854,63 @@ impl ReviewView {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(8.))
                             .text_size(px(11.))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(hex(NOTE_TEXT))
-                                    .child(format!(
-                                        "Review note · line {} · {}",
-                                        comment.line,
-                                        comment.side.label()
-                                    )),
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(hex(NOTE_TEXT))
+                                            .child(format!(
+                                                "{} · line {} · {}",
+                                                comment.author,
+                                                comment.line,
+                                                comment.side.label()
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(MONO)
+                                            .text_size(px(10.))
+                                            .text_color(fg(0.4))
+                                            .child(comment.id.clone()),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .id(("remove-inline", index))
-                                    .px_2()
-                                    .text_color(fg(0.4))
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(hex(DEL_MARK)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.delete_comment(index, cx)
-                                    }))
-                                    .child("Remove"),
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .id(("reply-to", index))
+                                            .px_2()
+                                            .text_color(fg(0.4))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(rgb(ACCENT)))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.start_reply(reply_id.clone(), window, cx)
+                                            }))
+                                            .child("Reply"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("remove-inline", index))
+                                            .px_2()
+                                            .text_color(fg(0.4))
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(hex(DEL_MARK)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_comment(remove_id.clone(), cx)
+                                            }))
+                                            .child("Remove"),
+                                    ),
                             ),
                     )
                     .child(
@@ -786,24 +918,36 @@ impl ReviewView {
                             .whitespace_normal()
                             .text_color(fg(0.9))
                             .child(comment.body),
-                    ),
+                    )
+                    .children(replies),
             )
     }
 
     fn render_inline_composer(
         &self,
-        line: &DiffLine,
+        line: Option<&DiffLine>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let anchor = line.anchor();
+        let heading = match (&self.reply_to, line.and_then(DiffLine::anchor)) {
+            (Some(target), _) => format!("Reply to {target}"),
+            (None, Some((side, number))) => {
+                format!("Comment on line {number} · {}", side.label())
+            }
+            (None, None) => "New review comment".to_string(),
+        };
+        let placeholder = if self.reply_to.is_some() {
+            "Write a reply…"
+        } else {
+            "Write a review comment…"
+        };
         let draft = if self.draft.is_empty() {
-            "Write a review comment…".to_string()
+            placeholder.to_string()
         } else {
             format!("{}▍", self.draft)
         };
 
         div()
-            .id("inline-composer")
+            .id("composer")
             .pl(px(112.))
             .pr(px(18.))
             .py(px(10.))
@@ -826,12 +970,7 @@ impl ReviewView {
                                 div()
                                     .text_color(hex(NOTE_TEXT))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(anchor.map_or_else(
-                                        || "New review comment".into(),
-                                        |(side, number)| {
-                                            format!("Comment on line {number} · {}", side.label())
-                                        },
-                                    )),
+                                    .child(heading),
                             )
                             .child(
                                 div()
@@ -907,10 +1046,20 @@ impl ReviewView {
             if let Some((side, number)) = line.anchor() {
                 for (comment_index, comment) in self.review.comments.iter().enumerate() {
                     if comment.path == file.path && comment.side == side && comment.line == number {
+                        let answering = self
+                            .reply_to
+                            .as_deref()
+                            .is_some_and(|target| thread_of(target) == comment.id);
                         rows.push(
                             self.render_inline_comment(comment_index, comment.clone(), cx)
                                 .into_any_element(),
                         );
+                        if answering {
+                            rows.push(
+                                self.render_inline_composer(Some(line), cx)
+                                    .into_any_element(),
+                            );
+                        }
                     }
                 }
             }
@@ -920,7 +1069,10 @@ impl ReviewView {
                 .as_ref()
                 .is_some_and(|anchor| anchor.file == file_index && anchor.line == line_index)
             {
-                rows.push(self.render_inline_composer(line, cx).into_any_element());
+                rows.push(
+                    self.render_inline_composer(Some(line), cx)
+                        .into_any_element(),
+                );
             }
         }
 
@@ -1085,7 +1237,7 @@ impl Render for ReviewView {
         let selected_stats = selected_file.map(|file| (file.additions, file.deletions));
         let language = self.highlight.grammar.map(Grammar::label);
         let file_count = self.diff.files.len();
-        let note_count = self.review.comments.len();
+        let note_count = self.review.len();
         let change_summary = format!(
             "{file_count} changed file{} · {note_count} review note{}",
             if file_count == 1 { "" } else { "s" },

@@ -42,6 +42,27 @@ pub enum LineKind {
     Deletion,
 }
 
+impl FileDiff {
+    /// Index of the diff row carrying a given side and line number.
+    pub fn index_of(&self, side: Side, line: u32) -> Option<usize> {
+        self.lines
+            .iter()
+            .position(|row| row.anchor() == Some((side, line)))
+    }
+
+    /// A few rows either side of `index`, quoted with a comment so the review
+    /// brief carries the change it refers to.
+    pub fn context_at(&self, index: usize) -> String {
+        let start = index.saturating_sub(2);
+        let end = (index + 3).min(self.lines.len());
+        self.lines[start..end]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 impl DiffLine {
     /// The line as it appears in the file, without the diff marker git prefixes
     /// it with. This is what lines up with a syntax-highlighted source.
@@ -75,7 +96,16 @@ impl Repository {
         })
     }
 
+    /// Where a review lives: a `.reviewpad` directory at the repository root,
+    /// so agents can find and read it without digging through `.git`. The
+    /// directory ignores itself — see `Review::save`.
     pub fn review_path(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("comments.json")
+    }
+
+    /// Where reviews lived before that, kept so an existing one migrates
+    /// forward instead of disappearing.
+    pub fn legacy_review_path(&self) -> PathBuf {
         self.git_dir.join("reviewpad").join("comments.json")
     }
 

@@ -9,7 +9,7 @@ ReviewPad is a local-first Git review tool with one Rust binary and two interfac
 - a GPU-rendered desktop review panel built with [GPUI](https://www.gpui.rs/), the UI framework created for Zed;
 - an agent-friendly CLI that can block while a human reviews, then return the completed review as Markdown on stdout.
 
-It reads staged, unstaged, and untracked changes. Comments are anchored to old or new line numbers and stored under `.git/reviewpad/comments.json`, so they do not dirty the working tree.
+It reads staged, unstaged, and untracked changes. Comments are anchored to old or new line numbers and stored in `.reviewpad/comments.json` at the repository root, where an agent can read them directly. That directory ignores itself, so review state never dirties the working tree it is inspecting. A review still living under the old `.git/reviewpad/` path is migrated forward the first time it is opened.
 
 ## Install
 
@@ -91,13 +91,41 @@ Noninteractive commands are also available:
 
 ```sh
 reviewpad export .   # print the current review as Markdown
+reviewpad list .     # list comments with their ids
 reviewpad clear .    # remove all saved comments
 ```
+
+### Writing comments and replying
+
+An agent can leave notes of its own and answer the ones it was given. Every
+comment gets a short id, and replying to one continues its thread:
+
+```sh
+# Anchor a note to a changed line. Prints the new id on stdout.
+id=$(reviewpad comment src/lib.rs 11 --body "This allocates on every call." --author claude)
+
+# Reply into that thread. --author signs it; ids nest as c1.1, c1.2, ...
+reviewpad reply "$id" --body "Fixed by borrowing instead." --author claude
+
+# Long bodies can come from stdin instead of an argument.
+git log -1 --format=%B | reviewpad reply c1.1 --author claude
+
+reviewpad remove c1.2   # drop a single reply, or c1 for the whole thread
+```
+
+`--side old` anchors to the line as it was before the change; the default is
+`new`. `--repo` points at another working tree, and `reviewpad list --json`
+prints the review file itself for a machine to parse.
+
+Replying accepts any id in a thread, so an agent can answer the message it just
+read without walking back to the root — `reply c1.2` and `reply c1` both append
+to thread `c1`.
 
 ## Data and scope
 
 - Diffs come from the current working tree relative to `HEAD`, plus untracked files.
 - Review state is repository-local and survives closing the app.
+- Comments and replies share one file, so the app and the CLI see each other's notes.
 - ReviewPad never stages, resets, commits, or modifies project files.
 - The Markdown includes the repository path, exact file/line/side anchors, comment text, and nearby diff context.
 
