@@ -46,10 +46,15 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const INSTRUCTIONS: &str = "\
 ReviewPad is a local review panel for a Git working tree.
 
-Ask for a human review with `open_review` (returns at once) or `request_review` \
-(waits until the person clicks Finish, then returns their review as Markdown). \
-Comments are saved as they are written, so `list_comments` and `export_review` \
-can be polled while the window is open.
+To have a person review a change, call `request_review` and let it block. It \
+opens the panel, waits for them to finish, and returns their review as Markdown \
+— waiting is the tool's job, not yours, and the result is the review itself. \
+Do not ask the user to tell you when they are done, and do not poll while it \
+runs.
+
+`open_review` is the exception: it opens the panel and returns at once, leaving \
+you to work out when the review is finished. Use it only when blocking is \
+impossible.
 
 Review a branch rather than uncommitted work by passing `base`, e.g. \"main\". \
 A line number only means something against a base, so pass the same one when \
@@ -196,19 +201,9 @@ fn tools() -> Value {
 
     json!([
         {
-            "name": "open_review",
-            "title": "Open the review panel",
-            "description": "Open ReviewPad on this working tree and return immediately. Use this to ask a person to look at the change. Comments are saved as they are written, so poll `list_comments` to see what they have said so far.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "repo": repo, "base": base, "include": include },
-            },
-            "annotations": { "readOnlyHint": true, "openWorldHint": true },
-        },
-        {
             "name": "request_review",
-            "title": "Request a review and wait",
-            "description": "Open ReviewPad and wait until the person clicks Finish review, then return their review as Markdown. This blocks for as long as the review takes — often minutes — so the client must allow a long timeout; prefer `open_review` plus polling if it cannot. Returns whatever was saved if the window is closed without finishing.",
+            "title": "Request a review",
+            "description": "Have a person review this change. THIS IS THE TOOL FOR ASKING FOR A REVIEW. It opens the review panel, waits for them to work through the diff and click Finish review, and returns what they wrote as a Markdown brief to implement. Blocking is the point — the call returns the review itself, so waiting is handled for you. Expect it to take minutes; do not poll, and do not ask the user to tell you when they have finished. Returns whatever was saved if the window is closed without finishing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -221,6 +216,16 @@ fn tools() -> Value {
                         "minimum": 1,
                     },
                 },
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true },
+        },
+        {
+            "name": "open_review",
+            "title": "Open the panel without waiting",
+            "description": "Open the review panel and return at once, WITHOUT the review. Use `request_review` instead unless you genuinely cannot block — this tool leaves you no way to know when the person has finished, so you would have to poll `list_comments` and guess. Suitable for putting a panel up alongside other work, not for asking for a review and acting on it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo, "base": base, "include": include },
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
         },
@@ -384,9 +389,9 @@ fn open_review<W: Write>(
         command.stdout(Stdio::null());
         command.spawn().context("could not open the review panel")?;
         return Ok(format!(
-            "Opened ReviewPad on {} for {described}. \
-             Poll `list_comments` to read what the reviewer writes; \
-             comments are saved as they are made.",
+            "Opened ReviewPad on {} for {described}. Nothing will tell you when the \
+             review is finished — poll `list_comments`, which sees comments as they \
+             are made. To be handed the finished review instead, call `request_review`.",
             repo.root.display()
         ));
     }
@@ -733,6 +738,43 @@ mod tests {
         }
         .tick("nobody asked");
         assert!(silence.is_empty(), "reported progress to nobody");
+    }
+
+    /// Asking for a review means `request_review`. The first cut of these
+    /// descriptions sold `open_review` as the way to "ask a person to look at
+    /// the change", and models took it at its word: the panel opened, nothing
+    /// waited, and the user had to say when they were done by hand.
+    #[test]
+    fn the_tool_that_waits_is_the_one_offered_first() {
+        let tools = tools();
+        let tools = tools.as_array().unwrap();
+        let position = |name: &str| {
+            tools
+                .iter()
+                .position(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        assert!(
+            position("request_review") < position("open_review"),
+            "the blocking tool should be listed first"
+        );
+
+        let description = |name: &str| {
+            tools[position(name)]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // The non-blocking one has to point back at the blocking one...
+        assert!(
+            description("open_review").contains("request_review"),
+            "open_review does not point at request_review"
+        );
+        // ...and the blocking one must not send anybody away.
+        assert!(
+            !description("request_review").contains("open_review"),
+            "request_review steers away from itself"
+        );
     }
 
     #[test]

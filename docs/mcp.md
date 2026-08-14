@@ -215,12 +215,15 @@ optional `base` — `"main"` reviews `main...HEAD` rather than uncommitted work.
 it, and it is also the one thing a protocol built for fast tool calls finds
 surprising. Two ways through:
 
-- **Let it block.** The server emits a progress notification every 20 seconds,
-  which is what keeps idle-timeout clients from giving up. Raise the client's
-  tool timeout to match how long you actually take.
-- **Don't block.** Call `open_review`, which returns as soon as the window is
-  up, then poll `list_comments`. Comments are written to `.reviewpad` the
-  moment they are made, so polling sees them as they arrive.
+- **Let it block** — the default, and what an agent should reach for. The
+  server emits a progress notification every 20 seconds, which is what keeps
+  idle-timeout clients from giving up. Raise the client's tool timeout to match
+  how long you actually take. Claude Code moves a call this long to a background
+  task and picks it up when it returns, so the session is not held hostage.
+- **Don't block.** `open_review` returns as soon as the window is up, and then
+  nothing announces that you are done — the agent has to poll `list_comments`
+  and judge for itself. Comments are written to `.reviewpad` as they are made,
+  so polling does see them arrive.
 
 If the wait does time out, the window is left open — killing it would throw away
 a review you were in the middle of writing — and the call returns whatever has

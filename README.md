@@ -213,10 +213,10 @@ tools: `open_review`, `request_review`, `list_files`, `list_comments`,
 
 The point of it is `request_review`: an agent finishes a change, asks a person to
 look at it, and gets their notes back as a brief it can implement. That call
-blocks for as long as the review takes — the server sends progress notifications
-so the client does not give up — and a client with a short tool timeout can call
-`open_review` and poll `list_comments` instead, since comments are saved as they
-are written.
+blocks for as long as the review takes, which is what makes it useful — nobody
+has to tell the agent when the review is over. The server sends progress
+notifications so the client does not give up waiting. `open_review` is there for
+clients that cannot block, at the cost of having to poll.
 
 **[Setup for Codex, opencode, Cursor, VS Code, Zed, Gemini CLI and Claude
 Desktop →](docs/mcp.md)**
