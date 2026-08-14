@@ -1,9 +1,8 @@
 //! Tree-sitter syntax highlighting for diff bodies.
 //!
 //! Diffs are fragments, and a parser needs a whole document, so ReviewPad
-//! highlights the *files* a hunk came from — the working-tree copy for the new
-//! side, the `HEAD` blob for the old one — then indexes the resulting spans by
-//! line number. That is the same trick Zed plays: highlight the buffer, paint
+//! highlights the *files* a hunk came from — whichever revisions the two sides
+//! of the review live in — then indexes the resulting spans by line number. That is the same trick Zed plays: highlight the buffer, paint
 //! the diff from it.
 
 use std::{collections::HashMap, ops::Range};
@@ -11,7 +10,7 @@ use std::{collections::HashMap, ops::Range};
 use tree_sitter::Language;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
-use crate::git::{DiffLine, FileDiff, LineKind, Repository};
+use crate::git::{Base, DiffLine, FileDiff, LineKind, Repository};
 
 /// Capture names we recognize, in the order their colors are listed in
 /// [`SCOPE_COLORS`]. Tree-sitter matches the longest recognized prefix, so
@@ -340,22 +339,31 @@ impl DiffHighlight {
     /// Parse whichever sides of `file` its hunks actually reference. A file in
     /// an unsupported language, or one that has since been deleted, simply
     /// yields no spans and renders in flat diff colors.
-    pub fn load(repository: &Repository, file: &FileDiff, index: &mut SyntaxIndex) -> Self {
+    pub fn load(
+        repository: &Repository,
+        base: &Base,
+        file: &FileDiff,
+        index: &mut SyntaxIndex,
+    ) -> Self {
         let Some(grammar) = Grammar::for_path(&file.path) else {
             return Self::default();
         };
 
-        let working = repository.working_source(&file.path);
-        let new = working.and_then(|source| index.highlight(grammar, &source));
+        // Which revisions the two sides live in depends on what is under
+        // review: uncommitted work reads the working tree against `HEAD`, a
+        // branch reads its tip against where it left the base.
+        let new = repository
+            .new_source(base, &file.path)
+            .and_then(|source| index.highlight(grammar, &source));
 
         let has_deletions = file
             .lines
             .iter()
             .any(|line| line.kind == LineKind::Deletion);
-        let committed = has_deletions
-            .then(|| repository.head_source(&file.path))
-            .flatten();
-        let old = committed.and_then(|source| index.highlight(grammar, &source));
+        let old = has_deletions
+            .then(|| repository.old_source(base, &file.path))
+            .flatten()
+            .and_then(|source| index.highlight(grammar, &source));
 
         Self {
             grammar: Some(grammar),

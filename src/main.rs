@@ -3,7 +3,7 @@ mod app;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use reviewpad::{
-    git::{FileDiff, Repository},
+    git::{Base, FileDiff, Repository},
     media::{self, Medium},
     review::{Anchor, OrderedF64, Review, Side, Spot},
     update,
@@ -51,6 +51,11 @@ enum Command {
     Open {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Review a branch instead of uncommitted work: `--base main` shows
+        /// everything this branch added since it left main. A value containing
+        /// `..` is passed to git as a range.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
         /// Also review these files, whether or not git shows them. Render
         /// output is usually ignored, so a video has to be named to be seen.
         #[arg(long = "include", value_name = "FILE")]
@@ -60,6 +65,11 @@ enum Command {
     Request {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Review a branch or range instead of uncommitted work.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
+        #[arg(long = "include", value_name = "FILE")]
+        include: Vec<String>,
     },
     /// Print saved review comments as Markdown without opening a window.
     Export {
@@ -95,6 +105,10 @@ enum Command {
         /// Which side of the diff the line belongs to.
         #[arg(long, value_enum, default_value_t = SideArg::New)]
         side: SideArg,
+        /// The base the line number refers to. Must match what the review is
+        /// being taken against, or the anchor lands on a different line.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
         /// Name to sign the comment with.
         #[arg(long, default_value = reviewpad::review::DEFAULT_AUTHOR)]
         author: String,
@@ -147,8 +161,16 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Open { path, include }) => open(path, false, include),
-        Some(Command::Request { path }) => open(path, true, Vec::new()),
+        Some(Command::Open {
+            path,
+            base,
+            include,
+        }) => open(path, false, base, include),
+        Some(Command::Request {
+            path,
+            base,
+            include,
+        }) => open(path, true, base, include),
         Some(Command::Export { path }) => {
             let repository = Repository::discover(&path)?;
             let review = Review::open(&repository)?;
@@ -169,10 +191,12 @@ fn run() -> Result<()> {
             time,
             spot,
             side,
+            base,
             author,
             repo,
         }) => comment(Placement {
             repo,
+            base,
             file,
             line,
             time,
@@ -196,7 +220,7 @@ fn run() -> Result<()> {
                 update::install()
             }
         }
-        None => match open(cli.path.clone(), false, Vec::new()) {
+        None => match open(cli.path.clone(), false, None, Vec::new()) {
             Ok(()) => Ok(()),
             Err(_) if cli.path == Path::new(".") => app::pick_and_run(),
             Err(error) => Err(error),
@@ -204,10 +228,16 @@ fn run() -> Result<()> {
     }
 }
 
-fn open(path: PathBuf, print_on_finish: bool, include: Vec<String>) -> Result<()> {
+fn open(
+    path: PathBuf,
+    print_on_finish: bool,
+    base: Option<String>,
+    include: Vec<String>,
+) -> Result<()> {
     let repository = Repository::discover(&path)
         .with_context(|| format!("{} is not inside a Git working tree", path.display()))?;
-    let mut diff = repository.diff()?;
+    let base = base.as_deref().map(Base::parse).unwrap_or_default();
+    let mut diff = repository.diff_from(&base)?;
 
     // Named files, plus anything already carrying a comment — a render
     // commented on from the CLI has to be reachable in the panel afterwards.
@@ -223,13 +253,14 @@ fn open(path: PathBuf, print_on_finish: bool, include: Vec<String>) -> Result<()
         diff.files.push(FileDiff::media(path));
     }
 
-    app::run(repository, diff, print_on_finish)
+    app::run(repository, base, diff, print_on_finish)
 }
 
 /// Everything the `comment` subcommand was given, bundled so the resolution
 /// below reads as one decision rather than eight parameters.
 struct Placement {
     repo: PathBuf,
+    base: Option<String>,
     file: String,
     line: Option<u32>,
     time: Option<f64>,
@@ -244,6 +275,7 @@ struct Placement {
 fn comment(placement: Placement) -> Result<()> {
     let Placement {
         repo,
+        base,
         file,
         line,
         time,
@@ -255,7 +287,8 @@ fn comment(placement: Placement) -> Result<()> {
 
     let body = read_body(body)?;
     let repository = Repository::discover(&repo)?;
-    let diff = repository.diff()?;
+    let base = base.as_deref().map(Base::parse).unwrap_or_default();
+    let diff = repository.diff_from(&base)?;
 
     // A path git does not show is normal for a render — `out/` is ignored in a
     // Remotion project — so a media file that exists on disk is reviewable. A
@@ -328,6 +361,20 @@ fn comment(placement: Placement) -> Result<()> {
     };
 
     let mut review = Review::open(&repository)?;
+    // Line numbers only mean something against a base, so the review records
+    // which one it was taken from — and says so when a note is about to join
+    // comments that were placed against a different diff entirely.
+    let base_label = base.label();
+    if let Some(existing) = review.base.as_deref()
+        && existing != base_label
+        && !review.comments.is_empty()
+    {
+        eprintln!(
+            "warning: this review already holds notes taken against {existing}; \
+             their line numbers do not refer to {base_label}"
+        );
+    }
+    review.base = Some(base_label);
     let label = anchor.label();
     let id = review.add_comment(&file, anchor, &author, body, context);
     review.save(&repository.review_path())?;
@@ -397,6 +444,11 @@ fn list(path: PathBuf, json: bool) -> Result<()> {
     if review.is_empty() {
         println!("No review comments.");
         return Ok(());
+    }
+
+    // Say what the line numbers refer to before listing any.
+    if let Some(base) = &review.base {
+        println!("Reviewing {base}");
     }
 
     for comment in &review.comments {

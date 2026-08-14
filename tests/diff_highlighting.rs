@@ -3,7 +3,7 @@
 //! change, or the diff renders in the wrong colors.
 
 use reviewpad::{
-    git::{DiffLine, LineKind, Repository},
+    git::{Base, DiffLine, LineKind, Repository},
     syntax::{DiffHighlight, Grammar, SyntaxIndex},
 };
 use std::{fs, path::Path, process::Command};
@@ -52,7 +52,12 @@ fn both_sides_of_a_hunk_resolve_to_source_spans() {
         .find(|file| file.path == "src/total.rs")
         .expect("the edited file is in the diff");
 
-    let highlight = DiffHighlight::load(&repository, file, &mut SyntaxIndex::new());
+    let highlight = DiffHighlight::load(
+        &repository,
+        &Base::WorkingTree,
+        file,
+        &mut SyntaxIndex::new(),
+    );
     assert_eq!(highlight.grammar, Some(Grammar::Rust));
 
     // An added line reads from the working tree.
@@ -93,7 +98,12 @@ fn unsupported_languages_fall_back_to_flat_colors() {
     let diff = repository.diff().unwrap();
     let file = &diff.files[0];
 
-    let highlight = DiffHighlight::load(&repository, file, &mut SyntaxIndex::new());
+    let highlight = DiffHighlight::load(
+        &repository,
+        &Base::WorkingTree,
+        file,
+        &mut SyntaxIndex::new(),
+    );
     assert_eq!(highlight.grammar, None);
     assert!(
         file.lines

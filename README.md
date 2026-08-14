@@ -81,6 +81,29 @@ reviewpad open ../my-project
 
 `reviewpad pick` opens the same native directory picker used by the `.app` bundle.
 
+### Reviewing a branch
+
+By default ReviewPad shows uncommitted work. To review what a branch added
+instead — after an agent has committed and pushed, say — name the base it left:
+
+```sh
+reviewpad open --base main
+```
+
+That is `main...HEAD`: everything this branch changed since it diverged, and
+nothing `main` did in the meantime. Any revision works, and a value containing
+`..` is passed to git as a range verbatim:
+
+```sh
+reviewpad open --base origin/main
+reviewpad open --base v0.5.0...HEAD
+```
+
+The base is recorded in the review file and printed in the exported Markdown,
+because a line number only means something against a particular diff. Pass the
+same `--base` to `reviewpad comment` so an agent's notes land on the lines it
+meant.
+
 Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish review** saves and closes the panel.
 
 ## Use it from an AI agent
@@ -90,6 +113,8 @@ An agent should invoke:
 ```sh
 reviewpad request /absolute/path/to/repository
 ```
+
+Add `--base main` to review a branch rather than uncommitted changes.
 
 The process opens the review panel and waits. When the user clicks **Finish review**, the process writes only the Markdown review to stdout and exits. The agent can then implement each item.
 

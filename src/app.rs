@@ -14,7 +14,7 @@ use gpui::surface;
 use reviewpad::{
     avatar,
     field::{self, FieldStyle, TextField},
-    git::{DiffLine, DiffSet, FileDiff, LineKind, Repository},
+    git::{Base, DiffLine, DiffSet, FileDiff, LineKind, Repository},
     media::{self, Medium, Probe},
     player::Player,
     review::{Anchor, OrderedF64, Review, ReviewComment, Spot, thread_of},
@@ -276,14 +276,15 @@ struct Message<'a> {
     body: String,
 }
 
-pub fn run(repository: Repository, diff: DiffSet, print_on_finish: bool) -> Result<()> {
-    let review = Review::open(&repository)?;
+pub fn run(repository: Repository, base: Base, diff: DiffSet, print_on_finish: bool) -> Result<()> {
+    let mut review = Review::open(&repository)?;
+    review.base = Some(base.label());
 
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             field::bind_keys(cx);
-            open_review_window(cx, repository, diff, review, print_on_finish);
+            open_review_window(cx, repository, base, diff, review, print_on_finish);
         });
     Ok(())
 }
@@ -311,7 +312,7 @@ pub fn pick_and_run() -> Result<()> {
                 Ok((repository, diff)) => {
                     let review = Review::open(&repository).unwrap_or_default();
                     let _ = cx.update(|cx| {
-                        open_review_window(cx, repository, diff, review, false);
+                        open_review_window(cx, repository, Base::WorkingTree, diff, review, false);
                     });
                 }
                 Err(error) => {
@@ -328,6 +329,7 @@ pub fn pick_and_run() -> Result<()> {
 fn open_review_window(
     cx: &mut App,
     repository: Repository,
+    base: Base,
     diff: DiffSet,
     review: Review,
     print_on_finish: bool,
@@ -360,6 +362,7 @@ fn open_review_window(
         let view = cx.new(|cx| {
             let mut view = ReviewView {
                 repository,
+                base,
                 diff,
                 review,
                 selected_file: 0,
@@ -423,6 +426,8 @@ fn open_review_window(
 
 struct ReviewView {
     repository: Repository,
+    /// What is being reviewed — uncommitted work, or a branch range.
+    base: Base,
     diff: DiffSet,
     review: Review,
     selected_file: usize,
@@ -771,7 +776,7 @@ impl ReviewView {
     /// colors. Only the file on screen is parsed, and only when it changes.
     fn refresh_highlight(&mut self) {
         self.highlight = match self.diff.files.get(self.selected_file) {
-            Some(file) => DiffHighlight::load(&self.repository, file, &mut self.syntax),
+            Some(file) => DiffHighlight::load(&self.repository, &self.base, file, &mut self.syntax),
             None => DiffHighlight::default(),
         };
     }
@@ -2576,7 +2581,7 @@ impl ReviewView {
             )
     }
 
-    fn empty_state(title: &'static str, message: &'static str) -> gpui::Div {
+    fn empty_state(title: impl Into<SharedString>, message: impl Into<SharedString>) -> gpui::Div {
         div()
             .size_full()
             .flex()
@@ -2590,7 +2595,7 @@ impl ReviewView {
                     .text_size(px(15.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(fg(0.82))
-                    .child(title),
+                    .child(title.into()),
             )
             .child(
                 div()
@@ -2598,7 +2603,7 @@ impl ReviewView {
                     .text_center()
                     .text_size(px(12.))
                     .text_color(fg(0.5))
-                    .child(message),
+                    .child(message.into()),
             )
     }
 }
@@ -2726,7 +2731,14 @@ impl Render for ReviewView {
         let file_count = self.diff.files.len();
         let note_count = self.review.len();
         let change_summary = format!(
-            "{file_count} changed file{} · {note_count} review note{}",
+            "{}{file_count} changed file{} · {note_count} review note{}",
+            // A branch review is worth naming; uncommitted work is the default
+            // and reads as noise in the header.
+            if self.base.is_working_tree() {
+                String::new()
+            } else {
+                format!("{} · ", self.base.label())
+            },
             if file_count == 1 { "" } else { "s" },
             if note_count == 1 { "" } else { "s" }
         );
@@ -2995,10 +3007,17 @@ impl Render for ReviewView {
                         .flex_1()
                         .min_h_0()
                         .when(self.diff.files.is_empty(), |element| {
-                            element.child(Self::empty_state(
-                                "Working tree is clean",
-                                "No tracked, staged, or untracked changes are waiting for review.",
-                            ))
+                            element.child(if self.base.is_working_tree() {
+                                Self::empty_state(
+                                    "Working tree is clean",
+                                    "No tracked, staged, or untracked changes are waiting for review.",
+                                )
+                            } else {
+                                Self::empty_state(
+                                    "Nothing to review",
+                                    format!("{} has no changes.", self.base.label()),
+                                )
+                            })
                         })
                         .when(!self.diff.files.is_empty(), |element| {
                             element.child(

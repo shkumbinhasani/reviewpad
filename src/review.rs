@@ -155,6 +155,14 @@ pub struct ReviewComment {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Review {
+    /// What the review was taken against — `working tree`, or a range like
+    /// `main...HEAD`.
+    ///
+    /// Line numbers only mean something relative to a diff, so a reader that
+    /// does not know the base cannot tell whether a note refers to uncommitted
+    /// work or to a branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     pub comments: Vec<ReviewComment>,
 }
 
@@ -379,10 +387,13 @@ impl Review {
     }
 
     pub fn markdown(&self, repository: &Path) -> String {
-        let mut output = format!(
-            "# Code review\n\nRepository: `{}`\n\n",
-            repository.display()
-        );
+        let mut output = format!("# Code review\n\nRepository: `{}`\n", repository.display());
+        // The base decides what the line numbers refer to, so it is stated
+        // rather than assumed.
+        if let Some(base) = &self.base {
+            output.push_str(&format!("Reviewing: `{base}`\n"));
+        }
+        output.push('\n');
 
         if self.comments.is_empty() {
             output.push_str("No review comments.\n");

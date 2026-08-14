@@ -12,6 +12,59 @@ pub struct Repository {
     pub git_dir: PathBuf,
 }
 
+/// What a review is taken against.
+///
+/// Uncommitted work is only one of the cases. An agent that commits and pushes
+/// a branch has nothing in its working tree, and the review it wants is of the
+/// branch — so the base has to be sayable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Base {
+    /// The working tree against `HEAD`, plus untracked files.
+    #[default]
+    WorkingTree,
+    /// Everything a branch added since it diverged from this revision — the
+    /// three-dot range a pull request shows, so work landing on the base
+    /// meanwhile does not appear as if the branch did it.
+    Branch(String),
+    /// A range given verbatim to git, such as `HEAD~3..HEAD`.
+    Range(String),
+}
+
+impl Base {
+    /// `main` is a branch to diff against; anything containing `..` is already
+    /// a range and is passed through untouched.
+    pub fn parse(spec: &str) -> Self {
+        let spec = spec.trim();
+        if spec.contains("..") {
+            Base::Range(spec.to_string())
+        } else {
+            Base::Branch(spec.to_string())
+        }
+    }
+
+    /// The range as git will be asked for it.
+    pub fn range(&self) -> Option<String> {
+        match self {
+            Base::WorkingTree => None,
+            Base::Branch(revision) => Some(format!("{revision}...HEAD")),
+            Base::Range(range) => Some(range.clone()),
+        }
+    }
+
+    /// How the base reads in the panel and the exported review.
+    pub fn label(&self) -> String {
+        match self {
+            Base::WorkingTree => "working tree".to_string(),
+            Base::Branch(revision) => format!("{revision}...HEAD"),
+            Base::Range(range) => range.clone(),
+        }
+    }
+
+    pub fn is_working_tree(&self) -> bool {
+        matches!(self, Base::WorkingTree)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffSet {
     pub files: Vec<FileDiff>,
@@ -152,11 +205,90 @@ impl Repository {
             .flatten()
     }
 
+    /// The uncommitted diff — what `reviewpad` shows with no base given.
     pub fn diff(&self) -> Result<DiffSet> {
-        let patch = tracked_patch(&self.root)?;
-        let mut diff = parse_unified_diff(&patch);
-        diff.files.extend(self.untracked_files()?);
-        Ok(diff)
+        self.diff_from(&Base::WorkingTree)
+    }
+
+    /// The diff for a base. Untracked files belong to the working tree alone —
+    /// a committed range has no notion of them.
+    pub fn diff_from(&self, base: &Base) -> Result<DiffSet> {
+        let Some(range) = base.range() else {
+            let patch = tracked_patch(&self.root)?;
+            let mut diff = parse_unified_diff(&patch);
+            diff.files.extend(self.untracked_files()?);
+            return Ok(diff);
+        };
+
+        let output = git_output(
+            &self.root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--find-renames",
+                "--unified=3",
+                &range,
+                "--",
+            ],
+        )?;
+        if !output.status.success() {
+            bail!(
+                "could not diff {range}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(parse_unified_diff(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// The file as the base's "new" side has it: the working tree, or the tip
+    /// of the range.
+    pub fn new_source(&self, base: &Base, path: &str) -> Option<String> {
+        match base {
+            Base::WorkingTree => self.working_source(path),
+            Base::Branch(_) => self.revision_source("HEAD", path),
+            Base::Range(range) => {
+                let tip = range.rsplit("..").next().filter(|tip| !tip.is_empty());
+                self.revision_source(tip.unwrap_or("HEAD"), path)
+            }
+        }
+    }
+
+    /// The file as the base's "old" side has it, for highlighting deletions.
+    pub fn old_source(&self, base: &Base, path: &str) -> Option<String> {
+        match base {
+            Base::WorkingTree => self.revision_source("HEAD", path),
+            // Where the branch left the base, not where the base is now.
+            Base::Branch(revision) => self.diverged_source(revision, "HEAD", path),
+            Base::Range(range) => {
+                let start = range.split("..").next().filter(|start| !start.is_empty())?;
+                // git diffs a three-dot range from the merge base, so the old
+                // side of `main...HEAD` is not `main` itself.
+                match range.contains("...") {
+                    true => {
+                        let tip = range.rsplit("..").next().filter(|tip| !tip.is_empty());
+                        self.diverged_source(start, tip.unwrap_or("HEAD"), path)
+                    }
+                    false => self.revision_source(start, path),
+                }
+            }
+        }
+    }
+
+    /// A file as it stood where two revisions parted ways.
+    fn diverged_source(&self, from: &str, to: &str, path: &str) -> Option<String> {
+        let merge_base = git_text(&self.root, &["merge-base", from, to]).ok()?;
+        self.revision_source(merge_base.trim(), path)
+    }
+
+    /// A file as some revision has it.
+    pub fn revision_source(&self, revision: &str, path: &str) -> Option<String> {
+        let output = git_output(&self.root, &["show", &format!("{revision}:{path}")]).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).ok())
+            .flatten()
     }
 
     /// Untracked files, read directly rather than diffed one subprocess at a
@@ -454,6 +586,142 @@ mod tests {
         assert_eq!(repository.root, root.canonicalize().unwrap());
         assert!(diff.files.iter().any(|file| file.path == "tracked.txt"));
         assert!(diff.files.iter().any(|file| file.path == "new file.txt"));
+    }
+
+    #[test]
+    fn parses_a_base_from_a_branch_or_a_range() {
+        assert_eq!(Base::parse("main"), Base::Branch("main".into()));
+        assert_eq!(
+            Base::parse("origin/main"),
+            Base::Branch("origin/main".into())
+        );
+        assert_eq!(Base::parse("main..HEAD"), Base::Range("main..HEAD".into()));
+        assert_eq!(
+            Base::parse("v1.0...HEAD"),
+            Base::Range("v1.0...HEAD".into())
+        );
+    }
+
+    #[test]
+    fn a_branch_base_is_a_three_dot_range_from_where_it_diverged() {
+        // Two dots would also show what the base did meanwhile, which is not
+        // what this branch changed.
+        assert_eq!(
+            Base::Branch("main".into()).range().as_deref(),
+            Some("main...HEAD")
+        );
+        assert_eq!(Base::Range("a..b".into()).range().as_deref(), Some("a..b"));
+        assert_eq!(Base::WorkingTree.range(), None);
+        assert!(Base::WorkingTree.is_working_tree());
+        assert!(!Base::Branch("main".into()).is_working_tree());
+        assert_eq!(Base::WorkingTree.label(), "working tree");
+        assert_eq!(Base::Branch("main".into()).label(), "main...HEAD");
+    }
+
+    #[test]
+    fn reviews_what_a_branch_added_without_the_uncommitted_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run_git(root, &["init", "-q", "-b", "main"]);
+        run_git(root, &["config", "user.email", "reviewpad@example.com"]);
+        run_git(root, &["config", "user.name", "ReviewPad Test"]);
+        fs::write(root.join("shared.txt"), "one\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", "initial"]);
+
+        run_git(root, &["checkout", "-q", "-b", "feature"]);
+        fs::write(root.join("feature.txt"), "added by the branch\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", "feature work"]);
+
+        // Uncommitted, and so not part of what the branch committed.
+        fs::write(root.join("scratch.txt"), "not committed\n").unwrap();
+
+        let repository = Repository::discover(root).unwrap();
+        let diff = repository.diff_from(&Base::parse("main")).unwrap();
+        let paths: Vec<_> = diff.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, vec!["feature.txt"]);
+
+        // The working-tree review still sees the uncommitted file, and not the
+        // branch's committed one.
+        let working = repository.diff().unwrap();
+        let paths: Vec<_> = working
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["scratch.txt"]);
+    }
+
+    #[test]
+    fn a_branch_review_reads_its_sides_from_the_right_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run_git(root, &["init", "-q", "-b", "main"]);
+        run_git(root, &["config", "user.email", "reviewpad@example.com"]);
+        run_git(root, &["config", "user.name", "ReviewPad Test"]);
+        fs::write(root.join("file.txt"), "base\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", "initial"]);
+
+        run_git(root, &["checkout", "-q", "-b", "feature"]);
+        fs::write(root.join("file.txt"), "branch\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", "branch edit"]);
+
+        // The base moved on after the branch left it, and the working tree has
+        // drifted from both — neither should reach the review.
+        run_git(root, &["checkout", "-q", "main"]);
+        fs::write(root.join("file.txt"), "base moved on\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", "base edit"]);
+        run_git(root, &["checkout", "-q", "feature"]);
+        fs::write(root.join("file.txt"), "uncommitted\n").unwrap();
+
+        let repository = Repository::discover(root).unwrap();
+        let base = Base::parse("main");
+        assert_eq!(
+            repository.new_source(&base, "file.txt").as_deref(),
+            Some("branch\n")
+        );
+        assert_eq!(
+            repository.old_source(&base, "file.txt").as_deref(),
+            Some("base\n")
+        );
+
+        // A three-dot range spelled out by hand reads the same two sides as
+        // naming the branch does.
+        let spelled = Base::parse("main...HEAD");
+        assert_eq!(
+            repository.new_source(&spelled, "file.txt").as_deref(),
+            Some("branch\n")
+        );
+        assert_eq!(
+            repository.old_source(&spelled, "file.txt").as_deref(),
+            Some("base\n")
+        );
+
+        // Two dots means the base as it is now, not where the branch left it.
+        assert_eq!(
+            repository
+                .old_source(&Base::parse("main..HEAD"), "file.txt")
+                .as_deref(),
+            Some("base moved on\n")
+        );
+
+        // Uncommitted review still reads the working tree against HEAD.
+        assert_eq!(
+            repository
+                .new_source(&Base::WorkingTree, "file.txt")
+                .as_deref(),
+            Some("uncommitted\n")
+        );
+        assert_eq!(
+            repository
+                .old_source(&Base::WorkingTree, "file.txt")
+                .as_deref(),
+            Some("branch\n")
+        );
     }
 
     fn run_git(root: &Path, args: &[&str]) {
