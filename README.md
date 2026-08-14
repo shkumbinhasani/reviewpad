@@ -198,14 +198,38 @@ Replying accepts any id in a thread, so an agent can answer the message it just
 read without walking back to the root — `reply c1.2` and `reply c1` both append
 to thread `c1`.
 
+## Use it as an MCP server
+
+The same operations are available over the Model Context Protocol, so a client
+gets them as typed tools rather than shell invocations:
+
+```sh
+claude mcp add reviewpad -- reviewpad mcp
+```
+
+`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Nine
+tools: `open_review`, `request_review`, `list_files`, `list_comments`,
+`export_review`, `add_comment`, `reply`, `remove_comment`, `clear_review`.
+
+The point of it is `request_review`: an agent finishes a change, asks a person to
+look at it, and gets their notes back as a brief it can implement. That call
+blocks for as long as the review takes — the server sends progress notifications
+so the client does not give up — and a client with a short tool timeout can call
+`open_review` and poll `list_comments` instead, since comments are saved as they
+are written.
+
+**[Setup for Codex, opencode, Cursor, VS Code, Zed, Gemini CLI and Claude
+Desktop →](docs/mcp.md)**
+
 ## Data and scope
 
-- Diffs come from the current working tree relative to `HEAD`, plus untracked files.
+- Diffs come from the current working tree relative to `HEAD`, plus untracked files — or from a branch range when `--base` names one.
 - Untracked files are read directly rather than diffed one subprocess at a time; binary and oversized ones are listed without a patch.
 - Video is decoded by AVFoundation into buffers GPUI binds as textures, so nothing is written to disk to play a clip.
 - Review state is repository-local and survives closing the app.
 - Comments and replies share one file, so the app and the CLI see each other's notes.
 - ReviewPad never stages, resets, commits, or modifies project files.
+- The MCP server is local and talks to nothing but the client that started it; opening the panel means launching this same binary.
 - The Markdown includes the repository path, exact file/line/side anchors, comment text, and nearby diff context.
 
 ## Development

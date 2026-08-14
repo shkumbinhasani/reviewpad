@@ -1,0 +1,247 @@
+# ReviewPad as an MCP server
+
+`reviewpad mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio. It is a plain subcommand of the CLI you already have — no daemon, no
+port, no separate install. The client starts it, talks to it on stdin and
+stdout, and stops it by closing the pipe.
+
+What an agent gets from it: a way to ask *you* to look at a change, and then
+read what you said.
+
+```
+agent finishes a change
+  └─ request_review  → your review panel opens
+                     → you comment, click Finish review
+                     → the agent gets your notes as a Markdown brief
+```
+
+## Install it in your client
+
+Every client below runs the same command. If `reviewpad` is on your `PATH`,
+that is all you need:
+
+```sh
+reviewpad mcp
+```
+
+Some clients launch servers from a GUI app with a minimal `PATH` and will not
+find it. Use the absolute path there — `which reviewpad` prints it, typically
+`/opt/homebrew/bin/reviewpad`.
+
+<details open>
+<summary><b>Claude Code</b></summary>
+
+```sh
+claude mcp add reviewpad -- reviewpad mcp
+```
+
+`-s user` makes it available in every project; `-s project` writes a `.mcp.json`
+your team shares. Check it with `claude mcp list`, which health-checks each
+server.
+
+The project file, if you prefer to write it by hand:
+
+```json
+{
+  "mcpServers": {
+    "reviewpad": { "command": "reviewpad", "args": ["mcp"] }
+  }
+}
+```
+
+Claude Code aborts a stdio tool call that has been silent for 30 minutes. The
+server sends progress notifications while it waits, which resets that clock, so
+`request_review` survives a long review. To raise the ceiling anyway, add a
+per-server `timeout` in milliseconds to the `.mcp.json` entry.
+</details>
+
+<details>
+<summary><b>Codex</b></summary>
+
+```sh
+codex mcp add reviewpad -- reviewpad mcp
+```
+
+Or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.reviewpad]
+command = "reviewpad"
+args = ["mcp"]
+tool_timeout_sec = 1800
+```
+
+**Set `tool_timeout_sec`.** Codex gives a tool 60 seconds by default, which is
+long enough for every tool here except `request_review` — a review takes as long
+as reading the code takes. Without it, use `open_review` and poll.
+</details>
+
+<details>
+<summary><b>opencode</b></summary>
+
+In `opencode.json` (project) or `~/.config/opencode/opencode.json` (global):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "reviewpad": {
+      "type": "local",
+      "command": ["reviewpad", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Note the shape: `mcp` rather than `mcpServers`, and `command` is one array with
+the arguments in it.
+</details>
+
+<details>
+<summary><b>Cursor</b></summary>
+
+`.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` for every project:
+
+```json
+{
+  "mcpServers": {
+    "reviewpad": { "command": "reviewpad", "args": ["mcp"] }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>VS Code — GitHub Copilot</b></summary>
+
+`.vscode/mcp.json`, or the user-level file from **MCP: Open User Configuration**:
+
+```json
+{
+  "servers": {
+    "reviewpad": { "type": "stdio", "command": "reviewpad", "args": ["mcp"] }
+  }
+}
+```
+
+The top-level key is `servers`, not `mcpServers`.
+</details>
+
+<details>
+<summary><b>Zed</b></summary>
+
+In `settings.json`:
+
+```json
+{
+  "context_servers": {
+    "reviewpad": { "command": "reviewpad", "args": ["mcp"], "env": {} }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Gemini CLI</b></summary>
+
+```sh
+gemini mcp add reviewpad reviewpad mcp        # this project
+gemini mcp add -s user reviewpad reviewpad mcp  # every project
+```
+
+Or in `.gemini/settings.json` per project, or `~/.gemini/settings.json` for all:
+
+```json
+{
+  "mcpServers": {
+    "reviewpad": { "command": "reviewpad", "args": ["mcp"], "timeout": 1800000 }
+  }
+}
+```
+
+`timeout` is in milliseconds.
+</details>
+
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "reviewpad": { "command": "/opt/homebrew/bin/reviewpad", "args": ["mcp"] }
+  }
+}
+```
+
+Use the absolute path here. The desktop app does not inherit your shell's
+`PATH`, so a bare `reviewpad` will not be found. Restart the app afterwards.
+</details>
+
+<details>
+<summary><b>Anything else</b></summary>
+
+The server is an ordinary stdio MCP server, so any client can run it:
+
+- command: `reviewpad`
+- args: `["mcp"]`
+
+`reviewpad mcp <path>` takes the working tree that tools act on when a call does
+not name one; it defaults to the directory the client starts the server in.
+</details>
+
+## The tools
+
+| Tool | What it does |
+| --- | --- |
+| `open_review` | Open the panel and return at once |
+| `request_review` | Open the panel and wait for **Finish review**, then return the Markdown |
+| `list_files` | The files under review, with their line counts |
+| `list_comments` | Every comment and reply, as JSON, with ids |
+| `export_review` | The review as an implementation brief |
+| `add_comment` | Anchor a note to a line, a moment in a video, or a place on an image |
+| `reply` | Answer a comment, continuing its thread |
+| `remove_comment` | Delete one comment or reply |
+| `clear_review` | Delete every comment |
+
+Every tool takes an optional `repo`, and the ones that read a diff take an
+optional `base` — `"main"` reviews `main...HEAD` rather than uncommitted work.
+
+## Waiting for a person
+
+`request_review` blocks until you click **Finish review**. That is the point of
+it, and it is also the one thing a protocol built for fast tool calls finds
+surprising. Two ways through:
+
+- **Let it block.** The server emits a progress notification every 20 seconds,
+  which is what keeps idle-timeout clients from giving up. Raise the client's
+  tool timeout to match how long you actually take.
+- **Don't block.** Call `open_review`, which returns as soon as the window is
+  up, then poll `list_comments`. Comments are written to `.reviewpad` the
+  moment they are made, so polling sees them as they arrive.
+
+If the wait does time out, the window is left open — killing it would throw away
+a review you were in the middle of writing — and the call returns whatever has
+been saved so far.
+
+## Checking it works
+
+The server is just a program reading lines, so you can talk to it yourself:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | reviewpad mcp .
+```
+
+Two JSON lines back means it works. If a client says it cannot connect:
+
+- **`reviewpad: command not found`** — the client's `PATH` is not your shell's.
+  Use the absolute path from `which reviewpad`.
+- **Connects, but every tool fails** — the `repo` is not a Git working tree.
+  Pass one explicitly, or start the server with `reviewpad mcp /path/to/repo`.
+- **Nothing at all** — check the client's MCP log. The server writes protocol
+  messages to stdout and everything else to stderr, so a crash shows up there.

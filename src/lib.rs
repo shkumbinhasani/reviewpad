@@ -1,7 +1,9 @@
 pub mod avatar;
 pub mod field;
 pub mod git;
+pub mod mcp;
 pub mod media;
+pub mod place;
 pub mod player;
 pub mod review;
 pub mod syntax;

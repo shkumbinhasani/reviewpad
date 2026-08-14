@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use reviewpad::{
     git::{Base, FileDiff, Repository},
-    media::{self, Medium},
-    review::{Anchor, OrderedF64, Review, Side, Spot},
+    mcp,
+    place::{self, Placement},
+    review::{Review, Side},
     update,
 };
 use std::{
@@ -143,6 +144,15 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Run as a Model Context Protocol server on stdio.
+    ///
+    /// Point an MCP client at `reviewpad mcp` to give an agent the review as
+    /// tools: ask a person to look at a change, then read what they said.
+    Mcp {
+        /// Working tree the tools act on when a call does not name one.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Download and install the newest release.
     Update {
         /// Report whether an update exists without installing it.
@@ -203,7 +213,7 @@ fn run() -> Result<()> {
             spot,
             side: side.into(),
             author,
-            body,
+            body: read_body(body)?,
         }),
         Some(Command::Reply {
             id,
@@ -213,6 +223,7 @@ fn run() -> Result<()> {
         }) => reply(repo, id, author, body),
         Some(Command::List { json, path }) => list(path, json),
         Some(Command::Remove { id, repo }) => remove(repo, id),
+        Some(Command::Mcp { path }) => mcp::serve(path),
         Some(Command::Update { check }) => {
             if check {
                 update::check()
@@ -256,158 +267,17 @@ fn open(
     app::run(repository, base, diff, print_on_finish)
 }
 
-/// Everything the `comment` subcommand was given, bundled so the resolution
-/// below reads as one decision rather than eight parameters.
-struct Placement {
-    repo: PathBuf,
-    base: Option<String>,
-    file: String,
-    line: Option<u32>,
-    time: Option<f64>,
-    spot: Option<String>,
-    side: Side,
-    author: String,
-    body: Option<String>,
-}
-
-/// Anchor a comment to whatever the file is: a diff line, a moment in a video,
-/// or a place on an image.
+/// Save a comment and report where it landed. The rules for *where* live in
+/// `place`, since an MCP client asks the same question this subcommand does.
 fn comment(placement: Placement) -> Result<()> {
-    let Placement {
-        repo,
-        base,
-        file,
-        line,
-        time,
-        spot,
-        side,
-        author,
-        body,
-    } = placement;
-
-    let body = read_body(body)?;
-    let repository = Repository::discover(&repo)?;
-    let base = base.as_deref().map(Base::parse).unwrap_or_default();
-    let diff = repository.diff_from(&base)?;
-
-    // A path git does not show is normal for a render — `out/` is ignored in a
-    // Remotion project — so a media file that exists on disk is reviewable. A
-    // text file that is not in the diff is still almost always a typo.
-    let changed = diff.files.iter().find(|changed| changed.path == file);
-    if changed.is_none() {
-        let on_disk = repository.root.join(&file).is_file();
-        if !on_disk || Medium::of(&file) == Medium::Text {
-            let changed = diff
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>();
-            bail!(
-                "`{file}` has no changes to review. Changed files: {}",
-                if changed.is_empty() {
-                    "none".to_string()
-                } else {
-                    changed.join(", ")
-                }
-            );
-        }
+    let file = placement.file.clone();
+    let placed = place::place(placement)?;
+    if let Some(warning) = placed.warning {
+        eprintln!("warning: {warning}");
     }
-
-    let spot = spot.map(|spot| parse_spot(&spot)).transpose()?;
-    let medium = Medium::of(&file);
-    let (anchor, context) = match (line, time, spot) {
-        (Some(line), None, None) => {
-            if medium != Medium::Text {
-                bail!(
-                    "`{file}` is {}, so a line number does not point at anything — \
-                     use --time or --spot",
-                    medium.label()
-                );
-            }
-            let context = changed
-                .and_then(|changed| changed.index_of(side, line).map(|i| (changed, i)))
-                .map(|(changed, index)| changed.context_at(index))
-                .unwrap_or_default();
-            (Anchor::Line { side, line }, context)
-        }
-        (None, Some(seconds), spot) => {
-            if seconds < 0. {
-                bail!("--time cannot be negative");
-            }
-            // The frame is what a composition is written in, so carry it when
-            // the file's frame rate is readable.
-            let probe = media::probe(&repository.root.join(&file));
-            if let Some(probe) = probe
-                && seconds > probe.duration
-            {
-                bail!(
-                    "--time {seconds} is past the end of `{file}` ({})",
-                    media::timecode(probe.duration)
-                );
-            }
-            (
-                Anchor::Time {
-                    seconds: OrderedF64(seconds),
-                    frame: probe.map(|probe| probe.frame_at(seconds)),
-                    spot,
-                },
-                String::new(),
-            )
-        }
-        (None, None, Some(spot)) => (Anchor::Spot { spot }, String::new()),
-        // Nothing pointed at: a note about the file itself.
-        (None, None, None) => (Anchor::File, String::new()),
-        _ => bail!("--time, --spot and a line number are alternatives, not a combination"),
-    };
-
-    let mut review = Review::open(&repository)?;
-    // Line numbers only mean something against a base, so the review records
-    // which one it was taken from — and says so when a note is about to join
-    // comments that were placed against a different diff entirely.
-    let base_label = base.label();
-    if let Some(existing) = review.base.as_deref()
-        && existing != base_label
-        && !review.comments.is_empty()
-    {
-        eprintln!(
-            "warning: this review already holds notes taken against {existing}; \
-             their line numbers do not refer to {base_label}"
-        );
-    }
-    review.base = Some(base_label);
-    let label = anchor.label();
-    let id = review.add_comment(&file, anchor, &author, body, context);
-    review.save(&repository.review_path())?;
-
-    eprintln!("Added {id} on {file} — {label}");
-    println!("{id}");
+    eprintln!("Added {} on {file} — {}", placed.id, placed.label);
+    println!("{}", placed.id);
     Ok(())
-}
-
-/// `0.42,0.31` — a place on an image, normalized so it survives any display
-/// size. Percentages are accepted too, since that is how the export reads.
-fn parse_spot(text: &str) -> Result<Spot> {
-    let (x, y) = text
-        .split_once(',')
-        .context("a spot is `x,y`, for example --spot 0.42,0.31")?;
-
-    let axis = |value: &str| -> Result<f32> {
-        let value = value.trim();
-        let parsed: f32 = match value.strip_suffix('%') {
-            Some(percent) => percent.trim().parse::<f32>().map(|value| value / 100.),
-            None => value.parse::<f32>(),
-        }
-        .with_context(|| format!("`{value}` is not a number"))?;
-        if !(0. ..=1.).contains(&parsed) {
-            bail!("`{value}` is outside the image — a spot is 0..1, or a percentage");
-        }
-        Ok(parsed)
-    };
-
-    Ok(Spot {
-        x: axis(x)?,
-        y: axis(y)?,
-    })
 }
 
 fn reply(repo: PathBuf, id: String, author: String, body: Option<String>) -> Result<()> {
