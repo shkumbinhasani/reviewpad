@@ -178,6 +178,52 @@ mod window_drag {
     pub(super) fn start() {}
 }
 
+/// The Dock icon.
+///
+/// macOS reads it from the `.app` bundle around the executable, and neither way
+/// of reaching the panel from a terminal has one: PATH points at a symlink into
+/// the bundle, so AppKit resolves the symlink's own directory and finds no
+/// bundle, and the standalone tarball ships the bare binary with no bundle to
+/// find. An MCP client inherits the same fate — it launches this binary by the
+/// path it was started with. Handing AppKit the icon covers every launch,
+/// bundled or not.
+mod app_icon {
+    #[cfg(target_os = "macos")]
+    pub(super) fn set() {
+        use objc::{msg_send, runtime::Object, sel, sel_impl};
+
+        /// The same `.icns` the bundle carries, so the icon in the Dock cannot
+        /// disagree with the one in Finder.
+        const ICON: &[u8] = include_bytes!("../assets/ReviewPad.icns");
+
+        unsafe {
+            // Autoreleased, and drained by the run loop this is called from.
+            let data: *mut Object = msg_send![
+                objc::class!(NSData),
+                dataWithBytes: ICON.as_ptr()
+                length: ICON.len()
+            ];
+            let image: *mut Object = msg_send![objc::class!(NSImage), alloc];
+            // An `.icns` carries every size, so the Dock, ⌘-Tab and the app
+            // switcher each pick the rendition they want.
+            let image: *mut Object = msg_send![image, initWithData: data];
+            if image.is_null() {
+                return;
+            }
+            let app: *mut Object = msg_send![objc::class!(NSApplication), sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            // AppKit takes its own copy. This one is never released: a single
+            // image, set once at startup, is not worth the lifetime question.
+            let _: () = msg_send![app, setApplicationIconImage: image];
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn set() {}
+}
+
 /// Mark a region as window chrome: dragging it moves the window.
 fn draggable(element: gpui::Div) -> gpui::Div {
     element.on_mouse_down(MouseButton::Left, |_, _, _| window_drag::start())
@@ -283,6 +329,7 @@ pub fn run(repository: Repository, base: Base, diff: DiffSet, print_on_finish: b
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
+            app_icon::set();
             field::bind_keys(cx);
             open_review_window(cx, repository, base, diff, review, print_on_finish);
         });
@@ -293,6 +340,7 @@ pub fn run(repository: Repository, base: Base, diff: DiffSet, print_on_finish: b
 /// choose a Git repository with the native directory picker.
 pub fn pick_and_run() -> Result<()> {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        app_icon::set();
         field::bind_keys(cx);
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
