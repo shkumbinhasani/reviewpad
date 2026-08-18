@@ -22,7 +22,9 @@ use reviewpad::{
     markdown,
     media::{self, Medium, Probe},
     player::Player,
-    review::{Anchor, OrderedF64, Review, ReviewComment, Spot, prepare_state_dir, thread_of},
+    review::{
+        Anchor, OrderedF64, Progress, Review, ReviewComment, Spot, prepare_state_dir, thread_of,
+    },
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
     update,
 };
@@ -282,6 +284,11 @@ fn nothing_further(root: &Path) -> String {
     )
 }
 
+/// The `s` on the end of a count, since these read as sentences.
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 /// Where the row that was under the top edge has moved to in a new plan.
 ///
 /// By what the row *is*, not where it was: a note added to an earlier line, or a
@@ -429,6 +436,8 @@ struct Message<'a> {
     id: &'a str,
     /// Anchor line, shown on the root only.
     meta: Option<String>,
+    /// How far along the note is, shown on the root only.
+    progress: Progress,
     /// Where it is pinned, shown on the root only.
     attachment: Option<Attachment>,
     body: String,
@@ -627,6 +636,7 @@ fn open_review_window(
                 ),
                 focus: cx.focus_handle(),
                 submit,
+                waiting_for: None,
                 stamp: None,
                 replies_seen: review_replies,
                 _watch: None,
@@ -699,6 +709,9 @@ struct ReviewView {
     /// What the review file looked like when this panel last read or wrote it,
     /// so the watcher can tell somebody else's write from its own.
     stamp: Option<(std::time::SystemTime, u64)>,
+    /// Who is blocked waiting for the next round, if anybody is. The other half
+    /// of the state the panel used to have no way of knowing.
+    waiting_for: Option<String>,
     /// Replies accounted for. Anything past this arrived while we watched, and
     /// is worth saying out loud.
     replies_seen: usize,
@@ -1137,23 +1150,32 @@ impl ReviewView {
         let review = self.repository.review_path();
         let close = self.repository.close_path();
         let refresh = self.repository.refresh_path();
+        let waiting = self.repository.waiting_path();
         self._watch = Some(cx.spawn(async move |view, cx| {
             let mut ticks: u32 = 0;
             loop {
                 cx.background_executor().timer(step).await;
                 ticks += 1;
 
-                let (review, close, refresh) = (review.clone(), close.clone(), refresh.clone());
+                let (review, close, refresh, waiting) = (
+                    review.clone(),
+                    close.clone(),
+                    refresh.clone(),
+                    waiting.clone(),
+                );
                 let looked = cx
                     .background_spawn(async move {
                         (
                             stamp(&review),
                             close.exists(),
                             std::fs::read_to_string(&refresh).ok(),
+                            std::fs::read_to_string(&waiting)
+                                .ok()
+                                .map(|who| who.trim().to_string()),
                         )
                     })
                     .await;
-                let (current, closing, asked) = looked;
+                let (current, closing, asked, waiting_for) = looked;
 
                 let alive = view.update(cx, |view, cx| {
                     if closing {
@@ -1162,6 +1184,10 @@ impl ReviewView {
                     }
                     if current != view.stamp {
                         view.reload(cx);
+                    }
+                    if view.waiting_for != waiting_for {
+                        view.waiting_for = waiting_for;
+                        cx.notify();
                     }
                     // Touch the session file every few seconds. A panel killed
                     // outright cannot clean up after itself, so its age is what
@@ -2118,6 +2144,7 @@ impl ReviewView {
             author,
             id,
             meta,
+            progress,
             attachment,
             body,
         } = message;
@@ -2149,6 +2176,31 @@ impl ReviewView {
                                 .text_size(px(11.))
                                 .text_color(fg(0.4))
                                 .child(meta),
+                        )
+                    })
+                    // Where the note has got to, as the agent reports it. Open
+                    // notes carry nothing: an untouched note is the ordinary
+                    // case and does not need a label saying so.
+                    .when(progress != Progress::Open, |element| {
+                        let working = progress == Progress::Working;
+                        let (fill, ring, text) = if working {
+                            (hex(ACCENT_FILL), tint(ACCENT, 0.35), tint(ACCENT, 0.95))
+                        } else {
+                            (hex(ADD_BG), hex(ADD_MARK), hex(ADD_TEXT))
+                        };
+                        element.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(fill)
+                                .border_1()
+                                .border_color(ring)
+                                .font_family(MONO)
+                                .text_size(px(9.5))
+                                .text_color(text)
+                                .child(if working { "working" } else { "done" }),
                         )
                     })
                     .child(
@@ -2298,6 +2350,7 @@ impl ReviewView {
                             author: &reply.author,
                             id: &reply.id,
                             meta: None,
+                            progress: Progress::Open,
                             attachment: None,
                             body: reply.body.clone(),
                         },
@@ -2316,6 +2369,7 @@ impl ReviewView {
                     Anchor::Line { .. } | Anchor::File => Some(comment.anchor.label()),
                     _ => None,
                 },
+                progress: comment.progress,
                 attachment: Some(Attachment {
                     time: match comment.anchor {
                         Anchor::Time {
@@ -3503,9 +3557,14 @@ impl Render for ReviewView {
         // here pushed the pair straight out of the panel. The status line under
         // the diff is where the longer version of the same news goes.
         let drafts = self.review.draft_ids().len();
+        let asked_for = self.waiting_for.is_some();
         let submit_label = match (&self.submit, drafts) {
-            (Submit::Rounds(_), 0) => "Waiting…".to_string(),
-            (Submit::Rounds(_), sending) => format!("Send {sending}"),
+            (Submit::Rounds(_), sending) if sending > 0 => format!("Send {sending}"),
+            // Nothing drafted. Which of the two of you is being waited on
+            // decides what the button is for: telling the agent there is
+            // nothing further, or waiting on it to finish.
+            (Submit::Rounds(_), _) if asked_for => "Nothing further".to_string(),
+            (Submit::Rounds(_), _) => "Waiting…".to_string(),
             (Submit::Nothing | Submit::Stdout, _) => "Finish".to_string(),
         };
 
@@ -3644,6 +3703,48 @@ impl Render for ReviewView {
                                 .text_color(ink())
                                 .child(command),
                         ),
+                )
+            })
+            .when_some(self.waiting_for.clone(), |element, who| {
+                // Whoever is blocked on the person, said out loud. The panel used
+                // to look identical whether the agent was mid-change or sitting
+                // waiting for the next round.
+                let (working, done) = self.review.progress_counts();
+                let doing = match (working, done) {
+                    (0, 0) => String::new(),
+                    (0, done) => format!("{done} note{} dealt with", plural(done)),
+                    (working, 0) => format!("{working} note{} in hand", plural(working)),
+                    (working, done) => format!("{done} dealt with, {working} in hand"),
+                };
+                element.child(
+                    div()
+                        .mx(px(8.))
+                        .mb(px(2.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .rounded(px(8.))
+                        .bg(hex(ACCENT_FILL))
+                        .border_1()
+                        .border_color(tint(ACCENT, 0.22))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(ACCENT))
+                                .child(format!("{who} is waiting for you")),
+                        )
+                        .when(!doing.is_empty(), |element| {
+                            element.child(
+                                div()
+                                    .font_family(MONO)
+                                    .text_size(px(10.))
+                                    .text_color(ink())
+                                    .child(doing),
+                            )
+                        }),
                 )
             })
             .child(

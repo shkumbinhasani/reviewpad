@@ -338,6 +338,102 @@ fn a_round_reaches_the_agent_and_leaves_the_panel_open() {
     assert!(!refresh.exists(), "a refresh request was left on disk");
 }
 
+/// The state each side can see the other in.
+///
+/// An agent says what it has picked up and what it has settled, so a person
+/// waiting on it can tell that from silence. And while the agent is blocked on
+/// the next round it says so on disk, which is what stops the panel showing
+/// "waiting" at somebody who is waiting right back.
+#[test]
+fn each_side_can_see_what_the_other_is_doing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.email", "reviewpad@example.com"]);
+    git(root, &["config", "user.name", "ReviewPad Test"]);
+    std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "initial"]);
+    std::fs::write(root.join("src.rs"), "fn main() {\n    work();\n}\n").unwrap();
+
+    let mut server = Server::start(root);
+    server.call(
+        "add_comment",
+        json!({ "file": "src.rs", "line": 2, "body": "work() is undefined" }),
+    );
+
+    // Nothing is claimed to begin with.
+    let review: Value = serde_json::from_str(&server.call("list_comments", json!({}))).unwrap();
+    assert_eq!(review["comments"][0]["progress"], "open");
+
+    // Picked up.
+    let started = server.call("start_work", json!({ "ids": ["c1"] }));
+    assert!(started.contains("c1"), "{started}");
+    let review: Value = serde_json::from_str(&server.call("list_comments", json!({}))).unwrap();
+    assert_eq!(review["comments"][0]["progress"], "working");
+
+    // Settled, with what was done said in the same call.
+    let finished = server.call(
+        "finish_work",
+        json!({ "id": "c1", "body": "Defined it in src.rs.", "author": "claude" }),
+    );
+    assert!(finished.contains("done"), "{finished}");
+    let review: Value = serde_json::from_str(&server.call("list_comments", json!({}))).unwrap();
+    assert_eq!(review["comments"][0]["progress"], "done");
+    assert_eq!(
+        review["comments"][0]["replies"][0]["body"],
+        "Defined it in src.rs."
+    );
+    assert_eq!(review["comments"][0]["replies"][0]["author"], "claude");
+
+    // An id nobody wrote is an error the model can act on, not a silent no-op.
+    let missed = server.call_expecting_failure("start_work", json!({ "ids": ["c9"] }));
+    assert!(missed.contains("list_comments"), "{missed}");
+
+    // A panel that is already open, so waiting for a round does not try to put a
+    // window on somebody's screen. This process is the stand-in: it is certainly
+    // alive, and being nobody's child it cannot outlive the test.
+    let state = root.join(".reviewpad");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("session.json"),
+        json!({
+            "pid": std::process::id(),
+            "submit_to": state.join("rounds").display().to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Who is waiting is on disk for as long as the wait lasts, and gone the
+    // moment it ends.
+    let waiting = state.join("waiting");
+    let watched = waiting.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        for _ in 0..200 {
+            if let Ok(who) = std::fs::read_to_string(&watched) {
+                let _ = sender.send(who.trim().to_string());
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    server.call(
+        "request_review",
+        json!({ "author": "claude", "timeout_seconds": 2 }),
+    );
+    watcher.join().unwrap();
+
+    assert_eq!(
+        receiver.recv().ok().as_deref(),
+        Some("claude"),
+        "the panel was never told who was waiting"
+    );
+    assert!(!waiting.exists(), "the wait marker outlived the wait");
+}
+
 /// Rounds submitted but not yet read.
 fn waiting_rounds(directory: &Path) -> usize {
     std::fs::read_dir(directory)

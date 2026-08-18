@@ -239,10 +239,10 @@ gets them as typed tools rather than shell invocations:
 claude mcp add reviewpad -- reviewpad mcp
 ```
 
-`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Eleven
-tools: `open_review`, `request_review`, `refresh_review`, `close_review`,
-`list_files`, `list_comments`, `export_review`, `add_comment`, `reply`,
-`remove_comment`, `clear_review`.
+`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Thirteen
+tools: `open_review`, `request_review`, `start_work`, `finish_work`,
+`refresh_review`, `close_review`, `list_files`, `list_comments`, `export_review`,
+`add_comment`, `reply`, `remove_comment`, `clear_review`.
 
 The point of it is `request_review`: an agent finishes a change, asks a person to
 look at it, and gets their notes back as a brief it can implement. That call
@@ -257,6 +257,12 @@ replies in each thread as it works, and those replies appear in the panel within
 a second, so you watch the work rather than waiting for a summary — then answer
 with another round. It ends when you close the window or the agent calls
 `close_review`.
+
+Neither side has to guess what the other is doing. The agent marks each note as
+it picks it up and as it settles it, so your notes carry `working` and `done`
+chips instead of leaving you to infer progress from silence — and when it is
+blocked waiting on your next round, the panel says so outright rather than
+sitting there showing "waiting" back at it.
 
 One window does the whole exchange. It re-reads the working tree every couple of
 seconds, so the diff keeps up with what the agent is changing without anybody

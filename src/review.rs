@@ -133,6 +133,35 @@ impl Anchor {
     }
 }
 
+/// How far along a note is, as whoever is working on it reports.
+///
+/// The panel had no way to show this, and the two sides ended up saying the same
+/// word at each other: the agent's `request_review` blocked on the person while
+/// the panel's own button read "waiting" about the agent. Now a note says which
+/// of them it is with.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Progress {
+    /// Nobody has claimed it yet.
+    #[default]
+    Open,
+    /// Being worked on right now.
+    Working,
+    /// Dealt with, as far as whoever did the work is concerned.
+    Done,
+}
+
+impl Progress {
+    /// How it reads in the panel and on the CLI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Progress::Open => "open",
+            Progress::Working => "working",
+            Progress::Done => "done",
+        }
+    }
+}
+
 /// A thread root: one note anchored to a line, plus whatever it started.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewComment {
@@ -162,6 +191,11 @@ pub struct ReviewComment {
     /// goes out with the next submission rather than vanishing.
     #[serde(default)]
     pub submitted: bool,
+    /// Whether anybody is on it, and whether they say it is finished. Set by the
+    /// agent as it works, so the person can watch a round being dealt with note
+    /// by note instead of guessing from silence.
+    #[serde(default)]
+    pub progress: Progress,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,6 +321,7 @@ impl Review {
             author: author.into(),
             replies: Vec::new(),
             submitted: false,
+            progress: Progress::default(),
         });
         id
     }
@@ -298,6 +333,35 @@ impl Review {
             .filter(|comment| !comment.submitted)
             .map(|comment| comment.id.clone())
             .collect()
+    }
+
+    /// Say how far along some notes are. Returns the ids that matched, so a
+    /// caller can tell an agent which of the ids it gave were not real.
+    pub fn set_progress(&mut self, ids: &[String], progress: Progress) -> Vec<String> {
+        let mut touched = Vec::new();
+        for comment in &mut self.comments {
+            if ids.iter().any(|id| thread_of(id) == comment.id) {
+                comment.progress = progress;
+                touched.push(comment.id.clone());
+            }
+        }
+        touched
+    }
+
+    /// How many notes are being worked on, and how many are finished — what the
+    /// panel says while the agent is away.
+    pub fn progress_counts(&self) -> (usize, usize) {
+        let working = self
+            .comments
+            .iter()
+            .filter(|comment| comment.progress == Progress::Working)
+            .count();
+        let done = self
+            .comments
+            .iter()
+            .filter(|comment| comment.progress == Progress::Done)
+            .count();
+        (working, done)
     }
 
     /// Hand these notes over, so the next round is only what came after them.
@@ -633,6 +697,50 @@ mod tests {
         // A new note on a file that already has a sent one is still owed.
         review.add_comment("src/lib.rs", Anchor::File, "you", "One more.", "");
         assert_eq!(review.notes_on("src/lib.rs"), (2, true));
+    }
+
+    #[test]
+    fn progress_is_set_by_id_and_reported() {
+        let mut review = review();
+        review.add_comment("src/other.rs", Anchor::File, "you", "Second.", "");
+        assert_eq!(review.progress_counts(), (0, 0));
+
+        assert_eq!(
+            review.set_progress(&["c1".to_string()], Progress::Working),
+            vec!["c1".to_string()]
+        );
+        assert_eq!(review.progress_counts(), (1, 0));
+
+        // A reply's id names its thread, so an agent can answer and finish in
+        // the same breath without walking back to the root.
+        assert_eq!(
+            review.set_progress(&["c1.4".to_string()], Progress::Done),
+            vec!["c1".to_string()]
+        );
+        assert_eq!(review.progress_counts(), (0, 1));
+
+        // An id that is not there matches nothing, and says so by omission.
+        assert!(
+            review
+                .set_progress(&["c9".to_string()], Progress::Done)
+                .is_empty()
+        );
+    }
+
+    /// A review saved before progress existed has no such field. Those notes are
+    /// open, which is what they were.
+    #[test]
+    fn a_review_written_before_progress_loads_as_open() {
+        let earlier = r#"{"comments":[
+            {"id":"c1","path":"a.rs","anchor":{"kind":"file"},"body":"one","context":"",
+             "author":"you","replies":[],"submitted":true}
+        ]}"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comments.json");
+        fs::write(&path, earlier).unwrap();
+
+        let review = Review::load(&path).unwrap();
+        assert_eq!(review.comments[0].progress, Progress::Open);
     }
 
     #[test]

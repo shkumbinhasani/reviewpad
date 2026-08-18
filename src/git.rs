@@ -196,6 +196,13 @@ impl Repository {
         self.root.join(".reviewpad").join("rounds")
     }
 
+    /// Written while somebody is blocked waiting for the next round, and removed
+    /// when they stop. It names them, so the panel can say who is waiting rather
+    /// than leaving both sides showing "waiting" at each other.
+    pub fn waiting_path(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("waiting")
+    }
+
     /// A request for the panel to re-read the working tree, left by whoever
     /// changed it. Carries the name of who is asking, so the panel can say why
     /// the diff moved instead of appearing to move on its own.

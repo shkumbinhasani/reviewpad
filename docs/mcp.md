@@ -14,9 +14,10 @@ agent finishes a change
   └─ request_review  → your review panel opens
                      → you draft notes, press Send
                      → the agent gets that round as a Markdown brief
-     reply           → its answers appear in the panel you are still reading
+     start_work      → the notes it picked up are marked in your panel
+     finish_work     → each one goes done, with its answer in the thread
      refresh_review  → the panel shows the code it just changed
-  └─ request_review  → waits for your next round
+  └─ request_review  → waits for your next round, and your panel says so
                      → you answer, or press Send with nothing left to say
      close_review    → the panel closes, unless you closed it first
 ```
@@ -204,6 +205,8 @@ not name one; it defaults to the directory the client starts the server in.
 | --- | --- |
 | `open_review` | Open the panel and return at once |
 | `request_review` | Open the panel and wait for a round of notes, then return the Markdown |
+| `start_work` | Say which notes you have picked up, before changing anything |
+| `finish_work` | Say a note is dealt with, and what you did about it |
 | `refresh_review` | Tell the open panel your changes are in, so the person sees the new diff |
 | `close_review` | Ask the open panel to close, once the exchange is done |
 | `list_files` | The files under review, with their line counts |
@@ -252,6 +255,23 @@ which asks the panel to save and exit rather than killing it.
 A round submitted while nobody is waiting is not lost — it sits in
 `.reviewpad/rounds` until the next `request_review` reads it. So reviewing before
 the agent gets around to asking works fine.
+
+## Who is waiting for whom
+
+Silence used to be ambiguous in both directions. The agent could be mid-change or
+sitting blocked on your next round, and the panel looked identical either way —
+its button read "Waiting…" about the agent while the agent's `request_review` was
+waiting about you.
+
+Now both halves are visible. `start_work` and `finish_work` mark each note as it
+is picked up and settled, so the panel shows `working` and `done` chips against
+your notes rather than leaving you to infer progress from replies. And while a
+`request_review` is blocked, it writes who is waiting to `.reviewpad/waiting`,
+which the panel turns into a banner — *claude is waiting for you*, with a count
+of what has been dealt with — and the send button becomes **Nothing further** so
+there is something to press when you have no more notes. The marker is removed
+however the wait ends, so the panel never claims somebody is listening when
+nobody is.
 
 ## Waiting for a person
 

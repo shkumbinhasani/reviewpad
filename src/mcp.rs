@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::{
     git::{Base, Repository},
     place::{self, Placement},
-    review::{DEFAULT_AUTHOR, Review, Side, prepare_state_dir},
+    review::{DEFAULT_AUTHOR, Progress as NoteProgress, Review, Side, prepare_state_dir},
 };
 
 /// Revisions this server can speak, newest first. A client asking for one of
@@ -59,13 +59,20 @@ The loop:
 round of notes, then returns that round as Markdown. Waiting is the tool's job, \
 not yours: expect minutes, do not poll, and do not ask the user to tell you when \
 they are done.
-2. Work through the notes. As you settle each one, `reply` in its thread — that \
-is how the person follows what you are doing, live, in the window they are \
-still looking at. Say what you changed, or push back if the note is wrong.
-3. `request_review` again to wait for their next round. They may be answering \
-your replies, or they may have nothing further, which comes back as a round \
-saying so.
-4. `close_review` when the exchange is finished, if the person has not closed \
+2. `start_work` with the ids you are taking on, BEFORE you change anything. The \
+panel marks those notes as being worked on, so the person can see what you have \
+picked up.
+3. Work through them. As you settle each one, `finish_work` with its id and a \
+`body` saying what you did — that marks the note done and posts your answer in \
+its thread, which the person reads live in the window they are still looking at. \
+Push back there too if the note is wrong. Do it note by note rather than in a \
+batch at the end.
+4. `refresh_review` once your changes are in, so the diff they are reading is \
+the one you just wrote.
+5. `request_review` again to wait for their next round — pass `author` so the \
+panel can tell them you are waiting on them now. They may be answering your \
+replies, or they may have nothing further, which comes back as a round saying so.
+6. `close_review` when the exchange is finished, if the person has not closed \
 the window themselves.
 
 ONE PANEL, ONE SESSION. The window stays on screen for the whole exchange and \
@@ -195,6 +202,8 @@ fn dispatch<W: Write>(
         "open_review" => open_review(args, default_repo, false, progress),
         "request_review" => open_review(args, default_repo, true, progress),
         "refresh_review" => refresh_review(args, default_repo),
+        "start_work" => set_progress(args, default_repo, NoteProgress::Working),
+        "finish_work" => finish_work(args, default_repo),
         "close_review" => close_review(args, default_repo),
         "list_files" => list_files(args, default_repo),
         "list_comments" => list_comments(args, default_repo),
@@ -240,6 +249,10 @@ fn tools() -> Value {
                         "description": "Give up waiting after this long. Defaults to 1800.",
                         "minimum": 1,
                     },
+                    "author": {
+                        "type": "string",
+                        "description": "Who is waiting. Give your own name: the panel tells the person who it is waiting for.",
+                    },
                 },
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
@@ -253,6 +266,34 @@ fn tools() -> Value {
                 "properties": { "repo": repo, "base": base, "include": include },
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
+        },
+        {
+            "name": "start_work",
+            "title": "Say you have started on some notes",
+            "description": "Mark review notes as being worked on RIGHT NOW, before you start changing anything. The panel shows each note's state, so this is how the person watching sees which of their notes you have picked up rather than guessing from silence. Take the whole round at once with `ids`, or claim them one at a time as you get to them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Note ids, such as [\"c1\", \"c3\"]. A reply's id names its thread." },
+                    "repo": repo,
+                },
+                "required": ["ids"],
+            },
+        },
+        {
+            "name": "finish_work",
+            "title": "Say a note is dealt with",
+            "description": "Mark ONE note as done, and say what you did about it in the same call by passing `body` — which posts it as a reply in that thread. Do this as you settle each note, not in a batch at the end: the person is reading the panel while you work. Pass `body` unless you have already replied; a note that goes green with nothing said is a note the person has to come and ask you about.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The note, such as `c1`." },
+                    "body": { "type": "string", "description": "What you did about it, posted as a reply." },
+                    "author": { "type": "string", "description": "Who did the work. Agents should give their own name." },
+                    "repo": repo,
+                },
+                "required": ["id"],
+            },
         },
         {
             "name": "refresh_review",
@@ -574,6 +615,15 @@ fn open_review<W: Write>(
         .get("timeout_seconds")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT);
+
+    // Say who is waiting, for as long as the wait lasts. Without this the panel
+    // cannot tell working-on-it silence from finished-and-waiting-on-you
+    // silence, and shows the person "waiting" while the agent waits on them.
+    let _waiting = Waiting::begin(
+        &repo,
+        &text(args, "author").unwrap_or_else(|| "The agent".to_string()),
+    );
+
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let started = Instant::now();
     let mut announced = Instant::now();
@@ -660,6 +710,94 @@ fn consume(directory: &Path) -> Result<Option<String>> {
     }
 
     Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Mark notes as being worked on, or as dealt with.
+fn set_progress(args: &Value, default_repo: &Path, progress: NoteProgress) -> Result<String> {
+    let repo = repository(args, default_repo)?;
+    let ids = strings(args, "ids");
+    let ids = if ids.is_empty() {
+        text(args, "id").map(|id| vec![id]).unwrap_or_default()
+    } else {
+        ids
+    };
+    if ids.is_empty() {
+        bail!("name the note or notes with `ids`");
+    }
+
+    let mut review = Review::open(&repo)?;
+    let touched = review.set_progress(&ids, progress);
+    if touched.is_empty() {
+        bail!(
+            "none of {} name a note in this review — `list_comments` has the ids",
+            ids.join(", ")
+        );
+    }
+    review.save(&repo.review_path())?;
+
+    let missed: Vec<&String> = ids
+        .iter()
+        .filter(|id| {
+            !touched
+                .iter()
+                .any(|found| found == crate::review::thread_of(id))
+        })
+        .collect();
+    let mut report = format!("Marked {} as {}", touched.join(", "), progress.label());
+    if !missed.is_empty() {
+        report.push_str(&format!(
+            "\n\nNo note answers to: {}",
+            missed
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(report)
+}
+
+/// Say a note is dealt with, and — in the same breath — what was done about it.
+fn finish_work(args: &Value, default_repo: &Path) -> Result<String> {
+    let said = match text(args, "body") {
+        // `reply` reads the body out of the same arguments; this only asks
+        // whether there is one to say.
+        Some(_) => Some(reply(args, default_repo)?),
+        None => None,
+    };
+    let marked = set_progress(args, default_repo, NoteProgress::Done)?;
+    Ok(match said {
+        Some(said) => format!("{marked}\n{said}"),
+        None => format!(
+            "{marked}\n\nNothing was said about it though — pass `body` so the person \
+             reading the panel learns what you did."
+        ),
+    })
+}
+
+/// A note on disk that somebody is blocked waiting for the next round.
+///
+/// The panel shows who it is, which is what stops the two sides sitting there
+/// showing each other the word "waiting". It removes itself however the wait
+/// ends — a round, a closed window, a timeout, an error — because a marker left
+/// behind would have the panel claim somebody is listening when nobody is.
+struct Waiting(PathBuf);
+
+impl Waiting {
+    fn begin(repo: &Repository, who: &str) -> Self {
+        let path = repo.waiting_path();
+        if let Some(parent) = path.parent() {
+            let _ = prepare_state_dir(parent);
+        }
+        let _ = std::fs::write(&path, format!("{who}\n"));
+        Self(path)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Tell the open panel that the code has changed, and wait for it to catch up.
