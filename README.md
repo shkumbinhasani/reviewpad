@@ -125,7 +125,7 @@ because a line number only means something against a particular diff. Pass the
 same `--base` to `reviewpad comment` so an agent's notes land on the lines it
 meant.
 
-Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish review** saves and closes the panel — when an agent is waiting, that button becomes **Send** and the panel stays open for the reply.
+Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish** saves and closes the panel — when an agent is waiting, that button becomes **Send 3** and the panel stays open for the reply, reading **Waiting…** once the round is away.
 
 ## Use it from an AI agent
 
@@ -230,10 +230,10 @@ gets them as typed tools rather than shell invocations:
 claude mcp add reviewpad -- reviewpad mcp
 ```
 
-`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Ten
-tools: `open_review`, `request_review`, `close_review`, `list_files`,
-`list_comments`, `export_review`, `add_comment`, `reply`, `remove_comment`,
-`clear_review`.
+`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Eleven
+tools: `open_review`, `request_review`, `refresh_review`, `close_review`,
+`list_files`, `list_comments`, `export_review`, `add_comment`, `reply`,
+`remove_comment`, `clear_review`.
 
 The point of it is `request_review`: an agent finishes a change, asks a person to
 look at it, and gets their notes back as a brief it can implement. That call
@@ -248,6 +248,11 @@ replies in each thread as it works, and those replies appear in the panel within
 a second, so you watch the work rather than waiting for a summary — then answer
 with another round. It ends when you close the window or the agent calls
 `close_review`.
+
+One window does the whole exchange. It re-reads the working tree every couple of
+seconds, so the diff keeps up with what the agent is changing without anybody
+reopening anything, and an agent that has just finished a change calls
+`refresh_review` rather than asking for a second review.
 
 **[Setup for Codex, opencode, Cursor, VS Code, Zed, Gemini CLI and Claude
 Desktop →](docs/mcp.md)**

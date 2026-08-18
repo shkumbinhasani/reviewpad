@@ -5,7 +5,7 @@ use app::Submit;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use reviewpad::{
-    git::{Base, FileDiff, Repository},
+    git::{Base, Repository},
     mcp,
     place::{self, Placement},
     review::{Review, Side},
@@ -257,23 +257,10 @@ fn open(path: PathBuf, submit: Submit, base: Option<String>, include: Vec<String
     let repository = Repository::discover(&path)
         .with_context(|| format!("{} is not inside a Git working tree", path.display()))?;
     let base = base.as_deref().map(Base::parse).unwrap_or_default();
-    let mut diff = repository.diff_from(&base)?;
-
-    // Named files, plus anything already carrying a comment — a render
-    // commented on from the CLI has to be reachable in the panel afterwards.
     let review = Review::open(&repository)?;
-    let commented = review.comments.iter().map(|comment| comment.path.clone());
-    for path in include.into_iter().chain(commented) {
-        if diff.files.iter().any(|file| file.path == path) {
-            continue;
-        }
-        if !repository.root.join(&path).is_file() {
-            continue;
-        }
-        diff.files.push(FileDiff::media(path));
-    }
+    let diff = app::reviewable_diff(&repository, &base, &include, &review)?;
 
-    app::run(repository, base, diff, submit)
+    app::run(repository, base, diff, include, submit)
 }
 
 /// Save a comment and report where it landed. The rules for *where* live in

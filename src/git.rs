@@ -196,6 +196,13 @@ impl Repository {
         self.root.join(".reviewpad").join("rounds")
     }
 
+    /// A request for the panel to re-read the working tree, left by whoever
+    /// changed it. Carries the name of who is asking, so the panel can say why
+    /// the diff moved instead of appearing to move on its own.
+    pub fn refresh_path(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("refresh")
+    }
+
     /// A request for the panel to close itself. The panel watches for this and
     /// exits cleanly, which killing its process would not: a review is worth
     /// more than the milliseconds saved by a signal.

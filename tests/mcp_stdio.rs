@@ -285,6 +285,31 @@ fn a_round_reaches_the_agent_and_leaves_the_panel_open() {
     assert!(second.contains("Still reads oddly"), "{second}");
     assert!(!second.contains("Rename `work`"), "{second}");
 
+    // Refreshing is signed, and reports back once the panel has taken it. The
+    // stand-in takes it the way the panel does: by deleting the request.
+    let refresh = state.join("refresh");
+    let taker = Command::new("sh")
+        .arg("-c")
+        .arg("while [ ! -f \"$1\" ]; do sleep 0.05; done; rm -f \"$1\"")
+        .arg("panel")
+        .arg(&refresh)
+        .spawn()
+        .expect("could not start the stand-in refresh");
+    let refreshed = server.call("refresh_review", json!({ "author": "claude" }));
+    let _ = taker.wait_with_output();
+    assert!(
+        refreshed.contains("showing your latest changes"),
+        "{refreshed}"
+    );
+    // It says what is under review now, so the agent knows what the person sees.
+    assert!(refreshed.contains("src.rs"), "{refreshed}");
+
+    // Asking for a panel that is already up opens nothing, and says so rather
+    // than reporting that it opened one.
+    let again = server.call("open_review", json!({}));
+    assert!(again.contains("ALREADY OPEN"), "{again}");
+    assert!(!again.contains("Opened ReviewPad"), "{again}");
+
     // Closing asks rather than kills, and reports a round nobody had read.
     std::fs::write(
         rounds.join("00000000000000000003.md"),
@@ -300,8 +325,17 @@ fn a_round_reaches_the_agent_and_leaves_the_panel_open() {
 
     // With no panel open there is nothing to close, and saying so is not a
     // failure the model has to handle.
-    let again = server.call("close_review", json!({}));
-    assert!(again.contains("No review panel is open"), "{again}");
+    let closed_again = server.call("close_review", json!({}));
+    assert!(
+        closed_again.contains("No review panel is open"),
+        "{closed_again}"
+    );
+
+    // Nor anything to refresh — and no request is left behind for a panel that
+    // opens later to act on out of nowhere.
+    let nothing = server.call("refresh_review", json!({}));
+    assert!(nothing.contains("No review panel is open"), "{nothing}");
+    assert!(!refresh.exists(), "a refresh request was left on disk");
 }
 
 /// Rounds submitted but not yet read.

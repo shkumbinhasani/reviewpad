@@ -15,6 +15,7 @@ agent finishes a change
                      → you draft notes, press Send
                      → the agent gets that round as a Markdown brief
      reply           → its answers appear in the panel you are still reading
+     refresh_review  → the panel shows the code it just changed
   └─ request_review  → waits for your next round
                      → you answer, or press Send with nothing left to say
      close_review    → the panel closes, unless you closed it first
@@ -203,6 +204,7 @@ not name one; it defaults to the directory the client starts the server in.
 | --- | --- |
 | `open_review` | Open the panel and return at once |
 | `request_review` | Open the panel and wait for a round of notes, then return the Markdown |
+| `refresh_review` | Tell the open panel your changes are in, so the person sees the new diff |
 | `close_review` | Ask the open panel to close, once the exchange is done |
 | `list_files` | The files under review, with their line counts |
 | `list_comments` | Every comment and reply, as JSON, with ids |
@@ -229,9 +231,20 @@ pressing Send again; the agent's next `request_review` is handed that round.
 Nothing left to say is also an answer: Send with no drafts tells the agent you
 read its replies and are content, rather than leaving it waiting.
 
-Only one panel is ever open per working tree. A panel announces itself in
-`.reviewpad/session.json`, so a second `request_review` drives the window
-already on screen instead of stacking another over the same review.
+Only one panel is ever open per working tree, for the whole exchange. A panel
+announces itself in `.reviewpad/session.json`, so `request_review` and
+`open_review` both drive the window already on screen instead of stacking
+another over the same review — and `open_review` says so rather than reporting
+that it opened one, because an agent told "opened" learns to keep asking for
+windows.
+
+The panel also follows the code. It re-reads the working tree every couple of
+seconds, so the diff you are looking at is the one the agent has just changed,
+not the one it started from — and a note you are in the middle of writing is
+never yanked off its line: a diff that arrives mid-note waits until you send it.
+`refresh_review` is how an agent says *I am done, look now*: it takes effect at
+once and answers with what the panel is now showing. That is the call to reach
+for after finishing a change, instead of trying to open a fresh review.
 
 Either side can end it: close the window, or let the agent call `close_review`,
 which asks the panel to save and exit rather than killing it.

@@ -228,6 +228,20 @@ mod app_icon {
     pub(super) fn set() {}
 }
 
+/// How many watcher ticks between re-reads of the working tree. At 400ms a
+/// tick, a change an agent makes shows up within two seconds.
+const DIFF_EVERY: u32 = 5;
+
+/// Whoever asked for the refresh, or a stand-in when they did not sign.
+fn who_or_agent(who: &str) -> String {
+    let who = who.trim();
+    if who.is_empty() {
+        "The agent".to_string()
+    } else {
+        who.to_string()
+    }
+}
+
 /// Enough of the review file to notice a change without reading it, so the
 /// watcher costs two `stat` calls a second rather than a parse.
 fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
@@ -390,7 +404,41 @@ impl Submit {
     }
 }
 
-pub fn run(repository: Repository, base: Base, diff: DiffSet, submit: Submit) -> Result<()> {
+/// The files a review covers: what git shows, plus anything named on the command
+/// line or already carrying a comment.
+///
+/// Render output is usually gitignored, so a video has to be asked for by name,
+/// and a render commented on from the CLI has to stay reachable in the panel
+/// afterwards. This lives here rather than at the call site because the panel
+/// rebuilds the same set every time the code changes underneath it.
+pub fn reviewable_diff(
+    repository: &Repository,
+    base: &Base,
+    include: &[String],
+    review: &Review,
+) -> Result<DiffSet> {
+    let mut diff = repository.diff_from(base)?;
+    let commented = review.comments.iter().map(|comment| comment.path.clone());
+
+    for path in include.iter().cloned().chain(commented) {
+        if diff.files.iter().any(|file| file.path == path) {
+            continue;
+        }
+        if !repository.root.join(&path).is_file() {
+            continue;
+        }
+        diff.files.push(FileDiff::media(path));
+    }
+    Ok(diff)
+}
+
+pub fn run(
+    repository: Repository,
+    base: Base,
+    diff: DiffSet,
+    include: Vec<String>,
+    submit: Submit,
+) -> Result<()> {
     let mut review = Review::open(&repository)?;
     review.base = Some(base.label());
 
@@ -399,7 +447,7 @@ pub fn run(repository: Repository, base: Base, diff: DiffSet, submit: Submit) ->
         .run(move |cx: &mut App| {
             app_icon::set();
             field::bind_keys(cx);
-            open_review_window(cx, repository, base, diff, review, submit);
+            open_review_window(cx, repository, base, diff, include, review, submit);
         });
     Ok(())
 }
@@ -433,6 +481,7 @@ pub fn pick_and_run() -> Result<()> {
                             repository,
                             Base::WorkingTree,
                             diff,
+                            Vec::new(),
                             review,
                             Submit::Nothing,
                         );
@@ -454,6 +503,7 @@ fn open_review_window(
     repository: Repository,
     base: Base,
     diff: DiffSet,
+    include: Vec<String>,
     review: Review,
     submit: Submit,
 ) {
@@ -502,6 +552,8 @@ fn open_review_window(
                 repository,
                 base,
                 diff,
+                include,
+                pending_diff: None,
                 review,
                 selected_file: 0,
                 anchor: None,
@@ -572,6 +624,11 @@ struct ReviewView {
     /// What is being reviewed — uncommitted work, or a branch range.
     base: Base,
     diff: DiffSet,
+    /// Files named on the command line, kept so re-reading the working tree
+    /// covers the same ground as the first read did.
+    include: Vec<String>,
+    /// A diff read while the person was mid-note, waiting for them to finish.
+    pending_diff: Option<DiffSet>,
     review: Review,
     selected_file: usize,
     anchor: Option<Target>,
@@ -1020,19 +1077,26 @@ impl ReviewView {
 
         let review = self.repository.review_path();
         let close = self.repository.close_path();
+        let refresh = self.repository.refresh_path();
         self._watch = Some(cx.spawn(async move |view, cx| {
             let mut ticks: u32 = 0;
             loop {
                 cx.background_executor().timer(step).await;
                 ticks += 1;
 
-                let (review, close) = (review.clone(), close.clone());
+                let (review, close, refresh) = (review.clone(), close.clone(), refresh.clone());
                 let looked = cx
-                    .background_spawn(async move { (stamp(&review), close.exists()) })
+                    .background_spawn(async move {
+                        (
+                            stamp(&review),
+                            close.exists(),
+                            std::fs::read_to_string(&refresh).ok(),
+                        )
+                    })
                     .await;
+                let (current, closing, asked) = looked;
 
                 let alive = view.update(cx, |view, cx| {
-                    let (current, closing) = looked;
                     if closing {
                         view.close(cx);
                         return false;
@@ -1045,6 +1109,45 @@ impl ReviewView {
                     // eventually tells a client that it is gone.
                     if ticks.is_multiple_of(12) {
                         view.announce_session();
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    return;
+                }
+
+                // Re-read the working tree too. The whole point of staying open
+                // is that the code changes while it is, and a diff from before
+                // those edits is a diff of the wrong thing. It costs a git
+                // subprocess, so it runs on the background thread and only
+                // every few ticks — or at once when somebody asks.
+                if asked.is_none() && !ticks.is_multiple_of(DIFF_EVERY) {
+                    continue;
+                }
+
+                let Ok(read) = view.read_with(cx, |view, _| {
+                    (
+                        view.repository.clone(),
+                        view.base.clone(),
+                        view.include.clone(),
+                        view.review.clone(),
+                    )
+                }) else {
+                    return;
+                };
+                let rebuilt = cx
+                    .background_spawn(async move {
+                        let (repository, base, include, review) = read;
+                        reviewable_diff(&repository, &base, &include, &review).ok()
+                    })
+                    .await;
+
+                let alive = view.update(cx, |view, cx| {
+                    if let Some(who) = asked {
+                        let _ = std::fs::remove_file(view.repository.refresh_path());
+                        view.offer_diff(rebuilt, Some(who), cx);
+                    } else {
+                        view.offer_diff(rebuilt, None, cx);
                     }
                     true
                 });
@@ -1088,6 +1191,99 @@ impl ReviewView {
         self.review = review;
         self.plan_diff();
         cx.notify();
+    }
+
+    /// Whether a note is being written, and so whether the ground under it can
+    /// be moved.
+    fn composing(&self) -> bool {
+        self.anchor.is_some() || self.reply_to.is_some()
+    }
+
+    /// Take a freshly read diff — unless the person is in the middle of a note,
+    /// in which case it waits.
+    ///
+    /// A note is aimed at a line by index. Swapping the diff out from under an
+    /// open composer would move that line, so the note would land somewhere its
+    /// author never chose.
+    fn offer_diff(
+        &mut self,
+        rebuilt: Option<DiffSet>,
+        asked: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rebuilt) = rebuilt else {
+            if asked.is_some() {
+                self.status = Some("Could not re-read the working tree".into());
+                cx.notify();
+            }
+            return;
+        };
+
+        if rebuilt == self.diff {
+            self.pending_diff = None;
+            if let Some(who) = asked {
+                self.status = Some(format!(
+                    "{} changed nothing under review",
+                    who_or_agent(&who)
+                ));
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.composing() {
+            self.pending_diff = Some(rebuilt);
+            self.status = Some(match asked {
+                Some(who) => format!(
+                    "{} changed the code — showing it once this note is sent",
+                    who_or_agent(&who)
+                ),
+                None => "The code changed — showing it once this note is sent".into(),
+            });
+            cx.notify();
+            return;
+        }
+
+        let told = asked.map(|who| format!("{} changed the code", who_or_agent(&who)));
+        self.apply_diff(rebuilt, told, cx);
+    }
+
+    /// Show a re-read diff, keeping the person where they were in it.
+    fn apply_diff(&mut self, rebuilt: DiffSet, told: Option<String>, cx: &mut Context<Self>) {
+        // Follow the selected file by name. A refresh can add or remove files
+        // above it, and an index would quietly select a different one.
+        let selected = self
+            .diff
+            .files
+            .get(self.selected_file)
+            .map(|file| file.path.clone());
+
+        self.diff = rebuilt;
+        self.pending_diff = None;
+        self.selected_file = selected
+            .and_then(|path| self.diff.files.iter().position(|file| file.path == path))
+            .unwrap_or(0);
+
+        self.plan_sidebar();
+        self.refresh_highlight();
+        self.refresh_medium(cx);
+        self.plan_diff();
+
+        let files = self.diff.files.len();
+        self.status = Some(format!(
+            "{} — showing {files} changed file{}",
+            told.unwrap_or_else(|| "Re-read the working tree".into()),
+            if files == 1 { "" } else { "s" }
+        ));
+        cx.notify();
+    }
+
+    /// Show a diff that arrived while a note was being written, now that it is
+    /// not being written any more.
+    fn apply_pending_diff(&mut self, cx: &mut Context<Self>) {
+        if let Some(rebuilt) = self.pending_diff.take() {
+            self.apply_diff(rebuilt, None, cx);
+        }
     }
 
     /// Close for good, answering the request that asked for it.
@@ -1220,6 +1416,8 @@ impl ReviewView {
         self.status = Some(saved.into());
         self.plan_diff();
         cx.notify();
+        // The note is placed, so a diff that was held back can be shown.
+        self.apply_pending_diff(cx);
     }
 
     fn delete_comment(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1261,6 +1459,7 @@ impl ReviewView {
         self.status = None;
         self.plan_diff();
         cx.notify();
+        self.apply_pending_diff(cx);
     }
 
     /// Return focus to the view so the file-list shortcuts work again.
@@ -3086,12 +3285,16 @@ impl Render for ReviewView {
         // The button says what pressing it does, and how much is riding on it.
         // Once a round is away and the drafts are gone, the panel is here to
         // read replies in — it does not pretend there is more to send.
+        //
+        // Kept to a few characters on purpose: this sits beside another button
+        // in a 262pt sidebar that can be dragged narrower still, and a sentence
+        // here pushed the pair straight out of the panel. The status line under
+        // the diff is where the longer version of the same news goes.
         let drafts = self.review.draft_ids().len();
         let submit_label = match (&self.submit, drafts) {
-            (Submit::Rounds(_), 0) => "Waiting for the agent".to_string(),
-            (Submit::Rounds(_), 1) => "Send 1 note".to_string(),
-            (Submit::Rounds(_), many) => format!("Send {many} notes"),
-            (Submit::Nothing | Submit::Stdout, _) => "Finish review".to_string(),
+            (Submit::Rounds(_), 0) => "Waiting…".to_string(),
+            (Submit::Rounds(_), sending) => format!("Send {sending}"),
+            (Submit::Nothing | Submit::Stdout, _) => "Finish".to_string(),
         };
 
         // Sidebar — part of the window itself, painted straight onto the glass
@@ -3235,12 +3438,17 @@ impl Render for ReviewView {
                 draggable(div())
                     .flex_none()
                     .flex()
+                    // The row is dragged narrower by the sidebar divider, so it
+                    // gives way by wrapping rather than by spilling its buttons
+                    // out over the diff.
+                    .flex_wrap()
                     .items_center()
                     .gap(px(6.))
                     .px(px(10.))
                     .py(px(8.))
                     .child(
                         div()
+                            .flex_none()
                             .font_family(MONO)
                             .text_size(px(11.))
                             .font_weight(FontWeight::MEDIUM)

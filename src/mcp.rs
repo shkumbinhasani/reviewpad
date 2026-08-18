@@ -68,8 +68,13 @@ saying so.
 4. `close_review` when the exchange is finished, if the person has not closed \
 the window themselves.
 
-Everything acts on the same panel — a second `request_review` drives the window \
-already on screen rather than opening another one.
+ONE PANEL, ONE SESSION. The window stays on screen for the whole exchange and \
+every tool acts on it. Never try to open a second — `open_review` and \
+`request_review` both drive the panel already up, and asking again for a window \
+you already have is the wrong instinct. When you have changed the code, the \
+panel notices within a couple of seconds by itself; `refresh_review` tells it at \
+once and confirms the person is looking at your work. That is the call to reach \
+for after finishing a change, not a fresh review.
 
 Notes a person is still writing are drafts and are not yours to act on; a round \
 is what they have chosen to send. `list_comments` shows both, marked.
@@ -189,6 +194,7 @@ fn dispatch<W: Write>(
     match name {
         "open_review" => open_review(args, default_repo, false, progress),
         "request_review" => open_review(args, default_repo, true, progress),
+        "refresh_review" => refresh_review(args, default_repo),
         "close_review" => close_review(args, default_repo),
         "list_files" => list_files(args, default_repo),
         "list_comments" => list_comments(args, default_repo),
@@ -222,7 +228,7 @@ fn tools() -> Value {
         {
             "name": "request_review",
             "title": "Request a review",
-            "description": "Have a person review this change. THIS IS THE TOOL FOR ASKING FOR A REVIEW. It opens the review panel and waits for the person to send a round of notes, then returns that round as a Markdown brief to implement. Blocking is the point — the call returns the review itself, so waiting is handled for you. Expect it to take minutes; do not poll, and do not ask the user to tell you when they have finished. The panel STAYS OPEN afterwards: `reply` in each thread as you work so they can read it live, then call this again to wait for their next round. Returns whatever was saved if they close the window instead.",
+            "description": "Have a person review this change. THIS IS THE TOOL FOR ASKING FOR A REVIEW. It opens the review panel and waits for the person to send a round of notes, then returns that round as a Markdown brief to implement. Blocking is the point — the call returns the review itself, so waiting is handled for you. Expect it to take minutes; do not poll, and do not ask the user to tell you when they have finished. The panel STAYS OPEN afterwards and there is only ever one of it: `reply` in each thread as you work so they can read it live, `refresh_review` when your changes are in, then call this again to wait for their next round — it drives the same window rather than opening another. Returns whatever was saved if they close the window instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -241,12 +247,26 @@ fn tools() -> Value {
         {
             "name": "open_review",
             "title": "Open the panel without waiting",
-            "description": "Open the review panel and return at once, WITHOUT the review. Use `request_review` instead unless you genuinely cannot block — this tool leaves you no way to know when a round has been sent, so you would have to poll `list_comments` and guess. Suitable for putting a panel up alongside other work, not for asking for a review and acting on it. A round submitted while nobody is waiting is kept, and the next `request_review` is handed it.",
+            "description": "Open the review panel and return at once, WITHOUT the review. Only ever opens one: called while a panel is up, it does nothing but tell you so — after changing code use `refresh_review`, not this. Use `request_review` instead unless you genuinely cannot block — this tool leaves you no way to know when a round has been sent, so you would have to poll `list_comments` and guess. Suitable for putting a panel up alongside other work, not for asking for a review and acting on it. A round submitted while nobody is waiting is kept, and the next `request_review` is handed it.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "repo": repo, "base": base, "include": include },
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
+        },
+        {
+            "name": "refresh_review",
+            "title": "Show the panel your latest changes",
+            "description": "Tell the OPEN panel that you have changed the code, so the person sees the new diff. Call this after finishing the work a review asked for — NOT `open_review` or a fresh `request_review`, which is the same one window either way. The panel re-reads the working tree every couple of seconds on its own, so this is about saying \"I am done, look now\" and being told they can see it; it returns the files now under review. Sign it with `author` so the panel can say who changed the code.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": repo,
+                    "base": base,
+                    "author": { "type": "string", "description": "Who changed the code. Agents should give their own name." },
+                },
+            },
+            "annotations": { "readOnlyHint": true },
         },
         {
             "name": "close_review",
@@ -457,6 +477,13 @@ enum Panel {
 }
 
 impl Panel {
+    /// Whether this call is what put the panel on screen. An agent told
+    /// "Opened ReviewPad" when nothing opened learns to keep asking for
+    /// windows, so the two cases are never reported as one.
+    fn was_opened_here(&self) -> bool {
+        matches!(self, Panel::Ours(_))
+    }
+
     fn alive(&mut self, repo: &Repository) -> bool {
         match self {
             // A child is exact: no pid to race, no file to trust. `try_wait`
@@ -527,11 +554,19 @@ fn open_review<W: Write>(
     let (mut panel, rounds) = panel(args, &repo)?;
 
     if !wait {
+        let opened = if panel.was_opened_here() {
+            format!("Opened ReviewPad on {}", repo.root.display())
+        } else {
+            format!(
+                "A panel is ALREADY OPEN on {} — this did not open a second one, and \
+                 nothing should. It follows your edits by itself",
+                repo.root.display()
+            )
+        };
         return Ok(format!(
-            "Opened ReviewPad on {} for {described}. Nothing will tell you when a round \
-             is submitted — poll `list_comments`, which sees comments as they are made. \
-             To be handed each round as it is sent instead, call `request_review`.",
-            repo.root.display()
+            "{opened}, for {described}. Nothing will tell you when a round is submitted \
+             — poll `list_comments`, which sees comments as they are made. To be handed \
+             each round as it is sent instead, call `request_review`.",
         ));
     }
 
@@ -625,6 +660,53 @@ fn consume(directory: &Path) -> Result<Option<String>> {
     }
 
     Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Tell the open panel that the code has changed, and wait for it to catch up.
+///
+/// The panel re-reads the working tree by itself every couple of seconds, so
+/// this is not what makes a change visible — it is what lets an agent say *I
+/// have done the work, look now* and be told the person is seeing it. Which is
+/// also the answer to the instinct to reopen the window.
+fn refresh_review(args: &Value, default_repo: &Path) -> Result<String> {
+    let repo = repository(args, default_repo)?;
+    let Some(_) = Session::read(&repo) else {
+        return Ok(
+            "No review panel is open for this working tree, so there is nothing to \
+             refresh. Call `request_review` to open one and be handed a review."
+                .to_string(),
+        );
+    };
+
+    let request = repo.refresh_path();
+    if let Some(parent) = request.parent() {
+        prepare_state_dir(parent)?;
+    }
+    // Signed, so the panel can say who changed the code rather than leaving the
+    // diff to move on its own.
+    let who = text(args, "author").unwrap_or_else(|| DEFAULT_AUTHOR.to_string());
+    std::fs::write(&request, format!("{who}\n"))
+        .with_context(|| format!("could not write {}", request.display()))?;
+
+    // The panel deletes the request as it takes it, which is the only honest
+    // signal that what is on screen is now the current diff.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !request.exists() {
+            return Ok(format!(
+                "The panel is showing your latest changes.\n\n{}",
+                list_files(args, default_repo)?
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(
+        "Asked the panel to re-read the working tree; it has not answered yet. It \
+        re-reads every couple of seconds regardless, so the person will see the \
+        change without another call."
+            .to_string(),
+    )
 }
 
 /// Ask the panel to close, and report anything it had not handed over yet.
