@@ -32,6 +32,27 @@ You can also grab `ReviewPad-macos-universal.zip` or the bare
 [latest release](https://github.com/shkumbinhasani/reviewpad/releases/latest);
 `SHA256SUMS` is published alongside them.
 
+### Betas
+
+A tag with a pre-release suffix — `v0.9.0-rc.1` — publishes to a separate
+channel, so a build can be tried on a real machine without going anywhere near
+what `brew install --cask reviewpad` hands out:
+
+```sh
+brew install --cask shkumbinhasani/tap/reviewpad@beta
+brew install --cask shkumbinhasani/tap/reviewpad       # go back to stable
+```
+
+The two casks own the same `ReviewPad.app`, so Homebrew keeps them mutually
+exclusive rather than letting one quietly overwrite the other — installing one
+tells you to uninstall the other first. A pre-release is left off
+`releases/latest`, so `reviewpad update` never offers a beta to somebody who did
+not ask for one; when the final ships, it does supersede the beta you are on.
+
+To test a change with no release at all: `./scripts/bundle-macos.sh` builds
+`dist/ReviewPad.app` locally, and CI attaches a `ReviewPad-app` artifact to every
+push and pull request.
+
 ### Updates
 
 ReviewPad checks for a newer release when it opens and shows an unobtrusive
@@ -104,7 +125,7 @@ because a line number only means something against a particular diff. Pass the
 same `--base` to `reviewpad comment` so an agent's notes land on the lines it
 meant.
 
-Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish review** saves and closes the panel.
+Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish review** saves and closes the panel — when an agent is waiting, that button becomes **Send** and the panel stays open for the reply.
 
 ## Use it from an AI agent
 
@@ -117,6 +138,8 @@ reviewpad request /absolute/path/to/repository
 Add `--base main` to review a branch rather than uncommitted changes.
 
 The process opens the review panel and waits. When the user clicks **Finish review**, the process writes only the Markdown review to stdout and exits. The agent can then implement each item.
+
+For a review that goes back and forth rather than ending there, add `--submit-to <dir>`: each time the user presses **Send**, that round of notes is written into the directory as a Markdown file and the window stays open, so the agent can reply into the threads it came from and the user reads those replies as they arrive. This is what the MCP server does, and it is the better shape — see below.
 
 Noninteractive commands are also available:
 
@@ -207,9 +230,10 @@ gets them as typed tools rather than shell invocations:
 claude mcp add reviewpad -- reviewpad mcp
 ```
 
-`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Nine
-tools: `open_review`, `request_review`, `list_files`, `list_comments`,
-`export_review`, `add_comment`, `reply`, `remove_comment`, `clear_review`.
+`reviewpad mcp [path]` speaks JSON-RPC over stdio and never daemonizes. Ten
+tools: `open_review`, `request_review`, `close_review`, `list_files`,
+`list_comments`, `export_review`, `add_comment`, `reply`, `remove_comment`,
+`clear_review`.
 
 The point of it is `request_review`: an agent finishes a change, asks a person to
 look at it, and gets their notes back as a brief it can implement. That call
@@ -217,6 +241,13 @@ blocks for as long as the review takes, which is what makes it useful — nobody
 has to tell the agent when the review is over. The server sends progress
 notifications so the client does not give up waiting. `open_review` is there for
 clients that cannot block, at the cost of having to poll.
+
+The review is a conversation, not a handover. Notes are drafts until you press
+**Send**; sending hands that round over and leaves the panel open. The agent
+replies in each thread as it works, and those replies appear in the panel within
+a second, so you watch the work rather than waiting for a summary — then answer
+with another round. It ends when you close the window or the agent calls
+`close_review`.
 
 **[Setup for Codex, opencode, Cursor, VS Code, Zed, Gemini CLI and Claude
 Desktop →](docs/mcp.md)**

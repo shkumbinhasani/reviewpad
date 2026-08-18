@@ -124,19 +124,21 @@ fn fetch_manifest() -> Result<Manifest> {
 /// Whether `candidate` is a newer release than what is running, comparing
 /// dotted numeric components so `0.10.0` sorts above `0.9.0`.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
-    fn parts(version: &str) -> Vec<u64> {
-        version
-            .trim_start_matches('v')
-            // Drop any pre-release suffix: `1.2.0-rc.1` compares as `1.2.0`.
-            .split('-')
-            .next()
-            .unwrap_or_default()
+    /// The numbers, and whether a pre-release suffix followed them.
+    fn parts(version: &str) -> (Vec<u64>, bool) {
+        let version = version.trim_start_matches('v');
+        let (numbers, prerelease) = match version.split_once('-') {
+            Some((numbers, _)) => (numbers, true),
+            None => (version, false),
+        };
+        let numbers = numbers
             .split('.')
             .map(|part| part.parse().unwrap_or(0))
-            .collect()
+            .collect();
+        (numbers, prerelease)
     }
 
-    let (candidate, current) = (parts(candidate), parts(current));
+    let ((candidate, candidate_pre), (current, current_pre)) = (parts(candidate), parts(current));
     let width = candidate.len().max(current.len());
     for index in 0..width {
         let (new, old) = (
@@ -147,7 +149,12 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
             return new > old;
         }
     }
-    false
+
+    // Same numbers: a final release supersedes its own pre-releases, which is
+    // what gets somebody testing `0.9.0-rc.1` onto `0.9.0` when it ships. The
+    // reverse is never an upgrade — the release feed does not offer
+    // pre-releases, and being moved onto one would be a downgrade anyway.
+    current_pre && !candidate_pre
 }
 
 /// Print whether a newer release exists, without touching anything on disk.
@@ -314,6 +321,19 @@ mod tests {
         assert!(is_newer("v0.2.0", "0.1.0"));
         assert!(!is_newer("0.1.0-rc.1", "0.1.0"));
         assert!(is_newer("0.2.0-rc.1", "0.1.0"));
+    }
+
+    /// Somebody testing a beta has to be told when the real thing ships, or the
+    /// build they were kind enough to try becomes the build they are stuck on.
+    #[test]
+    fn a_release_supersedes_its_own_prerelease() {
+        assert!(is_newer("0.9.0", "0.9.0-rc.1"));
+        assert!(is_newer("0.9.0", "0.9.0-rc.2"));
+        // Not the other way, and a pre-release is not newer than itself.
+        assert!(!is_newer("0.9.0-rc.1", "0.9.0"));
+        assert!(!is_newer("0.9.0-rc.1", "0.9.0-rc.1"));
+        // Numbers still decide first.
+        assert!(is_newer("0.9.1-rc.1", "0.9.0"));
     }
 
     #[test]

@@ -151,6 +151,17 @@ pub struct ReviewComment {
     pub author: String,
     #[serde(default)]
     pub replies: Vec<Reply>,
+    /// Whether this note has been handed to whoever asked for the review.
+    ///
+    /// A note written in the panel starts as a draft: the person is still
+    /// thinking, and an agent that acted on it now would be acting on half a
+    /// thought. Submitting flips it. A note written *by* an agent arrives
+    /// already delivered, so `place` marks those submitted outright.
+    ///
+    /// Defaulted, so a review saved before rounds existed loads as drafts and
+    /// goes out with the next submission rather than vanishing.
+    #[serde(default)]
+    pub submitted: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +202,22 @@ fn migrate_line_anchors(value: &mut serde_json::Value) {
             serde_json::json!({ "kind": "line", "side": side, "line": line }),
         );
     }
+}
+
+/// Make the `.reviewpad` directory, and have it ignore itself so review state
+/// stays out of `git status` — ReviewPad never dirties the working tree it is
+/// inspecting. Everything written beside a review goes through here: the review
+/// itself, the session a panel announces, a submitted round.
+pub fn prepare_state_dir(directory: &Path) -> Result<()> {
+    fs::create_dir_all(directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+
+    let ignore = directory.join(".gitignore");
+    if !ignore.exists() {
+        fs::write(&ignore, "*\n")
+            .with_context(|| format!("failed to write {}", ignore.display()))?;
+    }
+    Ok(())
 }
 
 /// The thread a comment or reply belongs to: `c3.2` lives in thread `c3`.
@@ -234,17 +261,7 @@ impl Review {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-
-            // The directory ignores itself, so review state stays out of `git
-            // status` in the repository being reviewed — ReviewPad never dirties
-            // the working tree it is inspecting.
-            let ignore = parent.join(".gitignore");
-            if !ignore.exists() {
-                fs::write(&ignore, "*\n")
-                    .with_context(|| format!("failed to write {}", ignore.display()))?;
-            }
+            prepare_state_dir(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
         fs::write(path, json)
@@ -269,8 +286,50 @@ impl Review {
             context: context.into(),
             author: author.into(),
             replies: Vec::new(),
+            submitted: false,
         });
         id
+    }
+
+    /// Ids of the notes still waiting to be sent.
+    pub fn draft_ids(&self) -> Vec<String> {
+        self.comments
+            .iter()
+            .filter(|comment| !comment.submitted)
+            .map(|comment| comment.id.clone())
+            .collect()
+    }
+
+    /// Hand these notes over, so the next round is only what came after them.
+    pub fn mark_submitted(&mut self, ids: &[String]) {
+        for comment in &mut self.comments {
+            if ids.contains(&comment.id) {
+                comment.submitted = true;
+            }
+        }
+    }
+
+    /// The same review narrowed to a few threads, for writing one round's brief
+    /// without teaching `markdown` about rounds.
+    pub fn round(&self, ids: &[String]) -> Self {
+        Self {
+            base: self.base.clone(),
+            comments: self
+                .comments
+                .iter()
+                .filter(|comment| ids.contains(&comment.id))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// How many replies the review holds, which is how the panel notices that
+    /// somebody else has answered while it was open.
+    pub fn reply_count(&self) -> usize {
+        self.comments
+            .iter()
+            .map(|comment| comment.replies.len())
+            .sum()
     }
 
     /// Reply into a thread. `target` may be the root or any reply in it, so a
@@ -503,6 +562,62 @@ mod tests {
         review.add_reply("c1", "agent", "one").unwrap();
         review.remove("c1").unwrap();
         assert!(review.comments.is_empty());
+    }
+
+    #[test]
+    fn a_note_is_a_draft_until_it_is_sent() {
+        let mut review = review();
+        assert_eq!(review.draft_ids(), vec!["c1".to_string()]);
+
+        let drafts = review.draft_ids();
+        review.mark_submitted(&drafts);
+        assert!(review.draft_ids().is_empty());
+
+        // What comes after a submission is the next round, not part of the one
+        // already sent.
+        review.add_comment("src/lib.rs", Anchor::File, "you", "And this.", "");
+        assert_eq!(review.draft_ids(), vec!["c2".to_string()]);
+    }
+
+    /// A round is one submission's worth of notes, so implementing it twice is
+    /// not something an agent can be asked to do by accident.
+    #[test]
+    fn a_round_carries_only_the_notes_it_sent() {
+        let mut review = review();
+        review.add_comment("src/other.rs", Anchor::File, "you", "Second note.", "");
+
+        let round = review.round(&["c2".to_string()]);
+        assert_eq!(round.comments.len(), 1);
+        assert_eq!(round.comments[0].body, "Second note.");
+        // The base travels with it: line numbers mean nothing without one.
+        assert_eq!(round.base, review.base);
+    }
+
+    #[test]
+    fn replies_are_counted_so_new_ones_can_be_noticed() {
+        let mut review = review();
+        assert_eq!(review.reply_count(), 0);
+        review.add_reply("c1", "claude", "Renamed it.").unwrap();
+        review.add_reply("c1", "claude", "And tested it.").unwrap();
+        assert_eq!(review.reply_count(), 2);
+    }
+
+    /// A review saved before rounds existed has no `submitted` field at all.
+    /// Loading it as drafts is what puts those notes in the next submission
+    /// rather than dropping them on the floor.
+    #[test]
+    fn a_review_written_before_rounds_loads_as_drafts() {
+        let earlier = r#"{"comments":[
+            {"id":"c1","path":"a.rs","anchor":{"kind":"file"},"body":"one","context":"",
+             "author":"you","replies":[]}
+        ]}"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comments.json");
+        fs::write(&path, earlier).unwrap();
+
+        let review = Review::load(&path).unwrap();
+        assert!(!review.comments[0].submitted);
+        assert_eq!(review.draft_ids(), vec!["c1".to_string()]);
     }
 
     #[test]

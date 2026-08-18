@@ -150,6 +150,9 @@ pub fn place(placement: Placement) -> Result<Placed> {
 
     let label = anchor.label();
     let id = review.add_comment(&file, anchor, &author, body, context);
+    // A note written from outside the panel is not a draft waiting to be sent:
+    // whoever wrote it has already said it. Only the panel holds drafts.
+    review.mark_submitted(std::slice::from_ref(&id));
     review.save(&repository.review_path())?;
 
     Ok(Placed { id, label, warning })

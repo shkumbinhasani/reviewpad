@@ -1,5 +1,7 @@
 mod app;
 
+use app::Submit;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use reviewpad::{
@@ -71,6 +73,12 @@ enum Command {
         base: Option<String>,
         #[arg(long = "include", value_name = "FILE")]
         include: Vec<String>,
+        /// Write each submitted round into this directory and leave the window
+        /// open, instead of printing once and closing. This is how an MCP client
+        /// drives a panel: it reads the round, replies into the threads it came
+        /// from, and the person watches those replies arrive.
+        #[arg(long, value_name = "DIR")]
+        submit_to: Option<PathBuf>,
     },
     /// Print saved review comments as Markdown without opening a window.
     Export {
@@ -175,12 +183,18 @@ fn run() -> Result<()> {
             path,
             base,
             include,
-        }) => open(path, false, base, include),
+        }) => open(path, Submit::Nothing, base, include),
         Some(Command::Request {
             path,
             base,
             include,
-        }) => open(path, true, base, include),
+            submit_to,
+        }) => open(
+            path,
+            submit_to.map_or(Submit::Stdout, Submit::rounds),
+            base,
+            include,
+        ),
         Some(Command::Export { path }) => {
             let repository = Repository::discover(&path)?;
             let review = Review::open(&repository)?;
@@ -231,7 +245,7 @@ fn run() -> Result<()> {
                 update::install()
             }
         }
-        None => match open(cli.path.clone(), false, None, Vec::new()) {
+        None => match open(cli.path.clone(), Submit::Nothing, None, Vec::new()) {
             Ok(()) => Ok(()),
             Err(_) if cli.path == Path::new(".") => app::pick_and_run(),
             Err(error) => Err(error),
@@ -239,12 +253,7 @@ fn run() -> Result<()> {
     }
 }
 
-fn open(
-    path: PathBuf,
-    print_on_finish: bool,
-    base: Option<String>,
-    include: Vec<String>,
-) -> Result<()> {
+fn open(path: PathBuf, submit: Submit, base: Option<String>, include: Vec<String>) -> Result<()> {
     let repository = Repository::discover(&path)
         .with_context(|| format!("{} is not inside a Git working tree", path.display()))?;
     let base = base.as_deref().map(Base::parse).unwrap_or_default();
@@ -264,7 +273,7 @@ fn open(
         diff.files.push(FileDiff::media(path));
     }
 
-    app::run(repository, base, diff, print_on_finish)
+    app::run(repository, base, diff, submit)
 }
 
 /// Save a comment and report where it landed. The rules for *where* live in

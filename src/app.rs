@@ -7,7 +7,11 @@ use gpui::{
     WindowBounds, WindowOptions, canvas, div, img, list, point, prelude::*, px, relative, rgb,
     rgba, size, svg, uniform_list,
 };
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use core_video::pixel_buffer::CVPixelBuffer;
 use gpui::surface;
@@ -17,7 +21,7 @@ use reviewpad::{
     git::{Base, DiffLine, DiffSet, FileDiff, LineKind, Repository},
     media::{self, Medium, Probe},
     player::Player,
-    review::{Anchor, OrderedF64, Review, ReviewComment, Spot, thread_of},
+    review::{Anchor, OrderedF64, Review, ReviewComment, Spot, prepare_state_dir, thread_of},
     syntax::{DiffHighlight, Grammar, SCOPE_COLORS, Span, SyntaxIndex},
     update,
 };
@@ -224,6 +228,45 @@ mod app_icon {
     pub(super) fn set() {}
 }
 
+/// Enough of the review file to notice a change without reading it, so the
+/// watcher costs two `stat` calls a second rather than a parse.
+fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let file = std::fs::metadata(path).ok()?;
+    Some((file.modified().ok()?, file.len()))
+}
+
+/// Put a round where whoever asked for the review is watching for it.
+///
+/// Each round is its own file, named for the moment it was sent and written
+/// under a dot-name before being renamed into place. So a reader polling the
+/// directory can never catch one half-written, a round nobody has read yet is
+/// never overwritten by the next, and neither side has to lock anything.
+fn hand_over(directory: &Path, round: &str) -> Result<()> {
+    if let Some(parent) = directory.parent() {
+        prepare_state_dir(parent)?;
+    }
+    std::fs::create_dir_all(directory)?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    // Zero-padded, so the names sort in the order they were sent.
+    let staging = directory.join(format!(".{stamp:020}.part"));
+    std::fs::write(&staging, round)?;
+    std::fs::rename(&staging, directory.join(format!("{stamp:020}.md")))?;
+    Ok(())
+}
+
+/// A round that says the reviewer had nothing to add.
+fn nothing_further(root: &Path) -> String {
+    format!(
+        "# Code review\n\nRepository: `{}`\n\nNo further notes — the reviewer read \
+         the replies and had nothing to add.\n",
+        root.display()
+    )
+}
+
 /// Mark a region as window chrome: dragging it moves the window.
 fn draggable(element: gpui::Div) -> gpui::Div {
     element.on_mouse_down(MouseButton::Left, |_, _, _| window_drag::start())
@@ -322,7 +365,32 @@ struct Message<'a> {
     body: String,
 }
 
-pub fn run(repository: Repository, base: Base, diff: DiffSet, print_on_finish: bool) -> Result<()> {
+/// What submitting a round does with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Submit {
+    /// Nothing to hand back: the panel is the whole point, as with
+    /// `reviewpad open`. Submitting saves and closes.
+    #[default]
+    Nothing,
+    /// Print the round to stdout and close, which is what a shell running
+    /// `reviewpad request` is waiting on.
+    Stdout,
+    /// Write each round into this directory and *stay open*, so the person can
+    /// read the replies it comes back with and send another round after them.
+    Rounds(PathBuf),
+}
+
+impl Submit {
+    /// Rounds go into this directory, resolved against the working directory
+    /// now rather than when it is used: the path is written into the session
+    /// file for other processes to read, and their working directory is not
+    /// ours.
+    pub fn rounds(directory: PathBuf) -> Self {
+        Submit::Rounds(std::path::absolute(&directory).unwrap_or(directory))
+    }
+}
+
+pub fn run(repository: Repository, base: Base, diff: DiffSet, submit: Submit) -> Result<()> {
     let mut review = Review::open(&repository)?;
     review.base = Some(base.label());
 
@@ -331,7 +399,7 @@ pub fn run(repository: Repository, base: Base, diff: DiffSet, print_on_finish: b
         .run(move |cx: &mut App| {
             app_icon::set();
             field::bind_keys(cx);
-            open_review_window(cx, repository, base, diff, review, print_on_finish);
+            open_review_window(cx, repository, base, diff, review, submit);
         });
     Ok(())
 }
@@ -360,7 +428,14 @@ pub fn pick_and_run() -> Result<()> {
                 Ok((repository, diff)) => {
                     let review = Review::open(&repository).unwrap_or_default();
                     let _ = cx.update(|cx| {
-                        open_review_window(cx, repository, Base::WorkingTree, diff, review, false);
+                        open_review_window(
+                            cx,
+                            repository,
+                            Base::WorkingTree,
+                            diff,
+                            review,
+                            Submit::Nothing,
+                        );
                     });
                 }
                 Err(error) => {
@@ -380,8 +455,23 @@ fn open_review_window(
     base: Base,
     diff: DiffSet,
     review: Review,
-    print_on_finish: bool,
+    submit: Submit,
 ) {
+    // Replies already on disk are not news; only what arrives from here on is.
+    let review_replies = review.reply_count();
+
+    // Take the session file down however the window goes away — the close
+    // button, ⌘Q, or an agent asking. A stale one is not fatal, since a client
+    // checks that the pid is alive, but it is a lie while it sits there.
+    let session = repository.session_path();
+    cx.on_app_quit(move |_| {
+        let session = session.clone();
+        async move {
+            let _ = std::fs::remove_file(&session);
+        }
+    })
+    .detach();
+
     let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -429,7 +519,10 @@ fn open_review_window(
                     cx,
                 ),
                 focus: cx.focus_handle(),
-                print_on_finish,
+                submit,
+                stamp: None,
+                replies_seen: review_replies,
+                _watch: None,
                 status: None,
                 syntax: SyntaxIndex::new(),
                 highlight: DiffHighlight::default(),
@@ -463,6 +556,8 @@ fn open_review_window(
             view.refresh_medium(cx);
             view.check_for_update(cx);
             view.load_portrait(cx);
+            view.announce_session();
+            view.start_watching(cx);
             view
         });
         window.focus(&view.read(cx).focus);
@@ -487,7 +582,17 @@ struct ReviewView {
     /// other text input rather than accumulating keystrokes.
     draft: Entity<TextField>,
     focus: FocusHandle,
-    print_on_finish: bool,
+    /// Where a submitted round goes, and whether the window survives it.
+    submit: Submit,
+    /// What the review file looked like when this panel last read or wrote it,
+    /// so the watcher can tell somebody else's write from its own.
+    stamp: Option<(std::time::SystemTime, u64)>,
+    /// Replies accounted for. Anything past this arrived while we watched, and
+    /// is worth saying out loud.
+    replies_seen: usize,
+    /// Follows the review file, and the request to close. Held so both stop
+    /// when the window does.
+    _watch: Option<gpui::Task<()>>,
     status: Option<String>,
     syntax: SyntaxIndex,
     highlight: DiffHighlight,
@@ -883,6 +988,137 @@ impl ReviewView {
         }
     }
 
+    /// Change the review on disk, and take the result as ours.
+    ///
+    /// The panel is not the only writer any more: while the window is open an
+    /// agent replies into the same file, so writing our whole copy back would
+    /// delete whatever arrived in between. Every edit re-reads, applies itself
+    /// to that, and saves — the load-modify-save the CLI has always done.
+    fn edit<T>(&mut self, change: impl FnOnce(&mut Review) -> Result<T>) -> Result<T> {
+        let path = self.repository.review_path();
+        let mut review = Review::load(&path)?;
+        // This window knows what it is showing; a note written from elsewhere
+        // may have recorded a different base.
+        review.base = self.review.base.clone();
+
+        let outcome = change(&mut review)?;
+        review.save(&path)?;
+
+        self.replies_seen = review.reply_count();
+        self.review = review;
+        self.stamp = stamp(&path);
+        Ok(outcome)
+    }
+
+    /// Follow the review file so replies written while this window is open
+    /// appear in it, and notice a request to close.
+    fn start_watching(&mut self, cx: &mut Context<Self>) {
+        // Fast enough that a reply feels like it lands as the agent writes it,
+        // slow enough to be two `stat` calls a second.
+        let step = Duration::from_millis(400);
+        self.stamp = stamp(&self.repository.review_path());
+
+        let review = self.repository.review_path();
+        let close = self.repository.close_path();
+        self._watch = Some(cx.spawn(async move |view, cx| {
+            let mut ticks: u32 = 0;
+            loop {
+                cx.background_executor().timer(step).await;
+                ticks += 1;
+
+                let (review, close) = (review.clone(), close.clone());
+                let looked = cx
+                    .background_spawn(async move { (stamp(&review), close.exists()) })
+                    .await;
+
+                let alive = view.update(cx, |view, cx| {
+                    let (current, closing) = looked;
+                    if closing {
+                        view.close(cx);
+                        return false;
+                    }
+                    if current != view.stamp {
+                        view.reload(cx);
+                    }
+                    // Touch the session file every few seconds. A panel killed
+                    // outright cannot clean up after itself, so its age is what
+                    // eventually tells a client that it is gone.
+                    if ticks.is_multiple_of(12) {
+                        view.announce_session();
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Take the review from disk, keeping this window's own state — what is
+    /// selected, what is half-typed — exactly as it was.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let path = self.repository.review_path();
+        let Ok(mut review) = Review::load(&path) else {
+            return;
+        };
+        review.base = self.review.base.clone();
+        self.stamp = stamp(&path);
+
+        let replies = review.reply_count();
+        let arrived = replies.saturating_sub(self.replies_seen);
+        if arrived > 0 {
+            // Name whoever answered: "claude replied" is the news, and the
+            // count on its own is not.
+            let author = review
+                .comments
+                .iter()
+                .filter_map(|comment| comment.replies.last())
+                .next_back()
+                .map(|reply| reply.author.clone())
+                .unwrap_or_else(|| "The agent".into());
+            self.status = Some(if arrived == 1 {
+                format!("{author} replied")
+            } else {
+                format!("{author} left {arrived} replies")
+            });
+        }
+
+        self.replies_seen = replies;
+        self.review = review;
+        self.plan_diff();
+        cx.notify();
+    }
+
+    /// Close for good, answering the request that asked for it.
+    fn close(&mut self, cx: &mut Context<Self>) {
+        let _ = std::fs::remove_file(self.repository.close_path());
+        let _ = std::fs::remove_file(self.repository.session_path());
+        cx.quit();
+    }
+
+    /// Say that this panel is open, and where it hands rounds over, so a client
+    /// that arrives later drives this window instead of opening a second one.
+    fn announce_session(&self) {
+        let path = self.repository.session_path();
+        if let Some(parent) = path.parent() {
+            let _ = prepare_state_dir(parent);
+        }
+        let session = serde_json::json!({
+            "pid": std::process::id(),
+            "submit_to": match &self.submit {
+                Submit::Rounds(directory) => Some(directory.display().to_string()),
+                Submit::Nothing | Submit::Stdout => None,
+            },
+            "repo": self.repository.root.display().to_string(),
+            "version": update::VERSION,
+        });
+        // A panel that cannot announce itself still reviews perfectly well.
+        if let Ok(json) = serde_json::to_vec_pretty(&session) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
     fn add_comment(&mut self, cx: &mut Context<Self>) {
         let body = self.draft.read(cx).text().trim().to_string();
         if body.is_empty() {
@@ -894,10 +1130,10 @@ impl ReviewView {
         // Answering an existing note continues its thread; otherwise the draft
         // opens a new one on the selected line.
         if let Some(target) = self.reply_to.clone() {
-            match self.review.add_reply(&target, AUTHOR, body) {
-                Ok(_) => self.finish_composing("Reply saved", cx),
+            match self.edit(|review| review.add_reply(&target, AUTHOR, body).map(|_| ())) {
+                Ok(()) => self.finish_composing("Reply saved", cx),
                 Err(error) => {
-                    self.status = Some(format!("{error}"));
+                    self.status = Some(format!("{error:#}"));
                     cx.notify();
                 }
             }
@@ -918,10 +1154,19 @@ impl ReviewView {
                 },
                 _ => Anchor::Spot { spot },
             };
-            self.review
-                .add_comment(path, anchor, AUTHOR, body, String::new());
-            self.pending_spot = None;
-            self.finish_composing("Comment saved", cx);
+            match self.edit(|review| {
+                review.add_comment(path, anchor, AUTHOR, body, String::new());
+                Ok(())
+            }) {
+                Ok(()) => {
+                    self.pending_spot = None;
+                    self.finish_composing("Comment saved", cx);
+                }
+                Err(error) => {
+                    self.status = Some(format!("Could not save: {error:#}"));
+                    cx.notify();
+                }
+            }
             return;
         }
 
@@ -944,14 +1189,22 @@ impl ReviewView {
 
         let context = file.context_at(anchor.line);
         let path = file.path.clone();
-        self.review.add_comment(
-            path,
-            Anchor::Line { side, line: number },
-            AUTHOR,
-            body,
-            context,
-        );
-        self.finish_composing("Comment saved", cx);
+        match self.edit(|review| {
+            review.add_comment(
+                path,
+                Anchor::Line { side, line: number },
+                AUTHOR,
+                body,
+                context,
+            );
+            Ok(())
+        }) {
+            Ok(()) => self.finish_composing("Comment saved", cx),
+            Err(error) => {
+                self.status = Some(format!("Could not save: {error:#}"));
+                cx.notify();
+            }
+        }
     }
 
     /// Empty the composer.
@@ -959,31 +1212,28 @@ impl ReviewView {
         self.draft.update(cx, |draft, cx| draft.clear(cx));
     }
 
-    /// Clear the composer and persist, reporting whichever outcome the save had.
+    /// Clear the composer once the note is saved, and say so.
     fn finish_composing(&mut self, saved: &str, cx: &mut Context<Self>) {
         self.clear_draft(cx);
         self.anchor = None;
         self.reply_to = None;
-        self.status = match self.review.save(&self.repository.review_path()) {
-            Ok(()) => Some(saved.into()),
-            Err(error) => Some(format!("Could not save: {error}")),
-        };
+        self.status = Some(saved.into());
         self.plan_diff();
         cx.notify();
     }
 
     fn delete_comment(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.review.remove(&id).is_err() {
-            return;
+        let target = id.clone();
+        match self.edit(move |review| review.remove(&target)) {
+            Ok(()) => {
+                if self.reply_to.as_deref() == Some(id.as_str()) {
+                    self.reply_to = None;
+                    self.clear_draft(cx);
+                }
+                self.status = Some("Comment removed".into());
+            }
+            Err(error) => self.status = Some(format!("{error:#}")),
         }
-        if self.reply_to.as_deref() == Some(id.as_str()) {
-            self.reply_to = None;
-            self.clear_draft(cx);
-        }
-        self.status = match self.review.save(&self.repository.review_path()) {
-            Ok(()) => Some("Comment removed".into()),
-            Err(error) => Some(format!("Could not save: {error}")),
-        };
         self.plan_diff();
         cx.notify();
     }
@@ -1038,17 +1288,59 @@ impl ReviewView {
         cx.notify();
     }
 
-    fn finish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.review.save(&self.repository.review_path()) {
-            self.status = Some(format!("Could not save: {error}"));
+    /// Hand the drafts over. What that means depends on who is waiting: a shell
+    /// wants them on stdout and its prompt back, an agent wants them in a file
+    /// and this window left open to answer into.
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.review.draft_ids();
+        let sent = ids.clone();
+        if let Err(error) = self.edit(move |review| {
+            review.mark_submitted(&sent);
+            Ok(())
+        }) {
+            self.status = Some(format!("Could not save: {error:#}"));
             cx.notify();
             return;
         }
-        if self.print_on_finish {
-            print!("{}", self.review.markdown(&self.repository.root));
+
+        match self.submit.clone() {
+            // Nobody is waiting on the other end: submitting is just done.
+            Submit::Nothing => {
+                window.remove_window();
+                cx.quit();
+            }
+            // A shell asked for the review and is holding its prompt for it, so
+            // the whole review goes out and the process ends.
+            Submit::Stdout => {
+                print!("{}", self.review.markdown(&self.repository.root));
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                window.remove_window();
+                cx.quit();
+            }
+            // An agent is waiting on a round, and will reply into the threads it
+            // came from — which is worth staying open to read.
+            Submit::Rounds(directory) => {
+                let round = if ids.is_empty() {
+                    // Nothing new to say is itself an answer, and a useful one:
+                    // it tells the agent the person read the replies and is
+                    // content, rather than leaving it waiting.
+                    nothing_further(&self.repository.root)
+                } else {
+                    self.review.round(&ids).markdown(&self.repository.root)
+                };
+
+                self.status = Some(match hand_over(&directory, &round) {
+                    Err(error) => format!("Could not hand the review over: {error:#}"),
+                    Ok(()) if ids.is_empty() => "Told the agent there is nothing further".into(),
+                    Ok(()) => format!(
+                        "Sent {} note{} — the panel stays open for the reply",
+                        ids.len(),
+                        if ids.len() == 1 { "" } else { "s" }
+                    ),
+                });
+                cx.notify();
+            }
         }
-        window.remove_window();
-        cx.quit();
     }
 
     /// A button with some weight to it.
@@ -2791,6 +3083,17 @@ impl Render for ReviewView {
             if note_count == 1 { "" } else { "s" }
         );
 
+        // The button says what pressing it does, and how much is riding on it.
+        // Once a round is away and the drafts are gone, the panel is here to
+        // read replies in — it does not pretend there is more to send.
+        let drafts = self.review.draft_ids().len();
+        let submit_label = match (&self.submit, drafts) {
+            (Submit::Rounds(_), 0) => "Waiting for the agent".to_string(),
+            (Submit::Rounds(_), 1) => "Send 1 note".to_string(),
+            (Submit::Rounds(_), many) => format!("Send {many} notes"),
+            (Submit::Nothing | Submit::Stdout, _) => "Finish review".to_string(),
+        };
+
         // Sidebar — part of the window itself, painted straight onto the glass
         // with no panel fill or divider, exactly like tgip's.
         let sidebar = div()
@@ -2950,8 +3253,8 @@ impl Render for ReviewView {
                             .on_click(cx.listener(|this, _, _, cx| this.copy_markdown(cx))),
                     )
                     .child(
-                        Self::button("finish", "Finish", true, cx)
-                            .on_click(cx.listener(|this, _, window, cx| this.finish(window, cx))),
+                        Self::button("submit", submit_label, true, cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             );
 
@@ -3136,6 +3439,42 @@ mod tests {
         let (text, highlights) = expand_tabs("let x", &[(0..3, 9)]);
         assert_eq!(text.as_ref(), "let x");
         assert_eq!(highlights[0].0, 0..3);
+    }
+
+    /// A round is handed over as a finished file or not at all: a reader polling
+    /// the directory picks up `.md` names, and a round still being written is a
+    /// dot-prefixed `.part` until the rename.
+    #[test]
+    fn each_round_is_handed_over_as_its_own_finished_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let rounds = directory.path().join("rounds");
+
+        hand_over(&rounds, "first round").unwrap();
+        hand_over(&rounds, "second round").unwrap();
+
+        let mut written: Vec<_> = std::fs::read_dir(&rounds)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        written.sort();
+
+        // Nothing half-written left behind, and one file per round.
+        assert!(
+            written.iter().all(|name| name.ends_with(".md")),
+            "{written:?}"
+        );
+        assert_eq!(written.len(), 2, "{written:?}");
+
+        // The names sort in the order the rounds were sent, which is the order a
+        // reader hands them to the agent.
+        let first = std::fs::read_to_string(rounds.join(&written[0])).unwrap();
+        let second = std::fs::read_to_string(rounds.join(&written[1])).unwrap();
+        assert_eq!(first, "first round");
+        assert_eq!(second, "second round");
+
+        // An unread round is never overwritten by the next one.
+        assert_ne!(written[0], written[1]);
     }
 
     /// The gutter has to fit the file's widest line number. When it did not,

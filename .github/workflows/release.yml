@@ -104,10 +104,11 @@ jobs:
 
   # Chained rather than triggered by `release: published`: GitHub suppresses
   # workflow runs for events raised with GITHUB_TOKEN, so an event-driven cask
-  # update would never fire. Prereleases are left off the stable tap.
+  # update would never fire. The tag picks the channel: a pre-release suffix
+  # publishes `reviewpad@beta`, so a beta is installable without ever touching
+  # what `brew install --cask reviewpad` hands out.
   cask:
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
     uses: ./.github/workflows/update-cask.yml
     with:
       tag: ${{ github.ref_name }}

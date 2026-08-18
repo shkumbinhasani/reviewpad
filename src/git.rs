@@ -181,6 +181,28 @@ impl Repository {
         self.git_dir.join("reviewpad").join("comments.json")
     }
 
+    /// What an open panel says about itself: its pid, and where it writes each
+    /// round it submits. Beside the review rather than in a temp directory, so
+    /// any client — including one started after the panel — can find it.
+    pub fn session_path(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("session.json")
+    }
+
+    /// Where submitted rounds land, one file each, to be read and deleted by
+    /// whoever asked for the review. A round is written once and never edited,
+    /// so a reader can take it at any moment without racing the writer — and
+    /// the reader deleting it is what makes the next round a new one.
+    pub fn rounds_dir(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("rounds")
+    }
+
+    /// A request for the panel to close itself. The panel watches for this and
+    /// exits cleanly, which killing its process would not: a review is worth
+    /// more than the milliseconds saved by a signal.
+    pub fn close_path(&self) -> PathBuf {
+        self.root.join(".reviewpad").join("close")
+    }
+
     /// The Git identity configured for this repository, used to look up the
     /// local user's avatar.
     pub fn user_email(&self) -> Option<String> {

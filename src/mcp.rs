@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::{
     git::{Base, Repository},
     place::{self, Placement},
-    review::{DEFAULT_AUTHOR, Review, Side},
+    review::{DEFAULT_AUTHOR, Review, Side, prepare_state_dir},
 };
 
 /// Revisions this server can speak, newest first. A client asking for one of
@@ -41,20 +41,38 @@ const DEFAULT_TIMEOUT: u64 = 1800;
 /// client's patience, and cheap.
 const HEARTBEAT: Duration = Duration::from_secs(20);
 
+/// How old a panel's session file may be before the panel is presumed gone.
+/// Comfortably more than the few seconds an open one takes to touch it, so a
+/// busy machine cannot make a live panel look dead.
+const STALE: Duration = Duration::from_secs(15);
+
 /// How told to the model the server is. This is the first thing a client reads,
 /// so it says what the thing is for rather than listing the tools again.
 const INSTRUCTIONS: &str = "\
-ReviewPad is a local review panel for a Git working tree.
+ReviewPad is a local review panel for a Git working tree. A review here is a \
+conversation, not a one-shot handover: the panel stays open, and the person \
+reads your replies in it as you write them.
 
-To have a person review a change, call `request_review` and let it block. It \
-opens the panel, waits for them to finish, and returns their review as Markdown \
-— waiting is the tool's job, not yours, and the result is the review itself. \
-Do not ask the user to tell you when they are done, and do not poll while it \
-runs.
+The loop:
 
-`open_review` is the exception: it opens the panel and returns at once, leaving \
-you to work out when the review is finished. Use it only when blocking is \
-impossible.
+1. `request_review` — opens the panel and blocks until the person submits a \
+round of notes, then returns that round as Markdown. Waiting is the tool's job, \
+not yours: expect minutes, do not poll, and do not ask the user to tell you when \
+they are done.
+2. Work through the notes. As you settle each one, `reply` in its thread — that \
+is how the person follows what you are doing, live, in the window they are \
+still looking at. Say what you changed, or push back if the note is wrong.
+3. `request_review` again to wait for their next round. They may be answering \
+your replies, or they may have nothing further, which comes back as a round \
+saying so.
+4. `close_review` when the exchange is finished, if the person has not closed \
+the window themselves.
+
+Everything acts on the same panel — a second `request_review` drives the window \
+already on screen rather than opening another one.
+
+Notes a person is still writing are drafts and are not yours to act on; a round \
+is what they have chosen to send. `list_comments` shows both, marked.
 
 Review a branch rather than uncommitted work by passing `base`, e.g. \"main\". \
 A line number only means something against a base, so pass the same one when \
@@ -171,6 +189,7 @@ fn dispatch<W: Write>(
     match name {
         "open_review" => open_review(args, default_repo, false, progress),
         "request_review" => open_review(args, default_repo, true, progress),
+        "close_review" => close_review(args, default_repo),
         "list_files" => list_files(args, default_repo),
         "list_comments" => list_comments(args, default_repo),
         "export_review" => export_review(args, default_repo),
@@ -203,7 +222,7 @@ fn tools() -> Value {
         {
             "name": "request_review",
             "title": "Request a review",
-            "description": "Have a person review this change. THIS IS THE TOOL FOR ASKING FOR A REVIEW. It opens the review panel, waits for them to work through the diff and click Finish review, and returns what they wrote as a Markdown brief to implement. Blocking is the point — the call returns the review itself, so waiting is handled for you. Expect it to take minutes; do not poll, and do not ask the user to tell you when they have finished. Returns whatever was saved if the window is closed without finishing.",
+            "description": "Have a person review this change. THIS IS THE TOOL FOR ASKING FOR A REVIEW. It opens the review panel and waits for the person to send a round of notes, then returns that round as a Markdown brief to implement. Blocking is the point — the call returns the review itself, so waiting is handled for you. Expect it to take minutes; do not poll, and do not ask the user to tell you when they have finished. The panel STAYS OPEN afterwards: `reply` in each thread as you work so they can read it live, then call this again to wait for their next round. Returns whatever was saved if they close the window instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -222,12 +241,22 @@ fn tools() -> Value {
         {
             "name": "open_review",
             "title": "Open the panel without waiting",
-            "description": "Open the review panel and return at once, WITHOUT the review. Use `request_review` instead unless you genuinely cannot block — this tool leaves you no way to know when the person has finished, so you would have to poll `list_comments` and guess. Suitable for putting a panel up alongside other work, not for asking for a review and acting on it.",
+            "description": "Open the review panel and return at once, WITHOUT the review. Use `request_review` instead unless you genuinely cannot block — this tool leaves you no way to know when a round has been sent, so you would have to poll `list_comments` and guess. Suitable for putting a panel up alongside other work, not for asking for a review and acting on it. A round submitted while nobody is waiting is kept, and the next `request_review` is handed it.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "repo": repo, "base": base, "include": include },
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true },
+        },
+        {
+            "name": "close_review",
+            "title": "Close the review panel",
+            "description": "Ask the open panel to close, once the exchange is finished and you have replied to everything. The person can also just close the window themselves, so this is a courtesy rather than a requirement — and never a substitute for replying. Reports any round that was submitted but never read.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": repo },
+            },
+            "annotations": { "openWorldHint": true },
         },
         {
             "name": "list_files",
@@ -242,7 +271,7 @@ fn tools() -> Value {
         {
             "name": "list_comments",
             "title": "Read the review",
-            "description": "Every saved comment and reply, with its id, the file and anchor it is attached to, and its author. Safe to poll while the panel is open.",
+            "description": "Every saved comment and reply, with its id, the file and anchor it is attached to, and its author. `submitted: false` marks a note the person is still drafting — it has not been sent to you, so do not act on it. Safe to poll while the panel is open.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "repo": repo },
@@ -286,7 +315,7 @@ fn tools() -> Value {
         {
             "name": "reply",
             "title": "Reply in a thread",
-            "description": "Answer a comment or an earlier reply, continuing its thread. Use this to respond to review feedback rather than opening a new comment.",
+            "description": "Answer a comment or an earlier reply, continuing its thread. This is how you report back on a review note — say what you changed, or why the note is wrong — rather than opening a new comment. A reply appears in the open panel within a second of being written, so the person reads it while you work; reply as you settle each note rather than saving them all for the end.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -360,7 +389,128 @@ impl<W: Write> Progress<'_, W> {
     }
 }
 
-/// Open the panel, and either wait for the person or leave them to it.
+/// What an open panel says about itself, in `.reviewpad/session.json`.
+///
+/// It exists so a panel is a thing a client can *find* rather than only
+/// something it started: a second `request_review` drives the window already on
+/// screen instead of stacking another one over the same review.
+struct Session {
+    pid: u32,
+    /// Where that panel writes the rounds it submits.
+    rounds: Option<PathBuf>,
+}
+
+impl Session {
+    /// The panel open for this tree, if there is one.
+    ///
+    /// A panel that exits takes its session file with it, so a file that is
+    /// still here is the first sign of a live one. Two things guard against a
+    /// panel that died without the chance: the pid has to still exist, and the
+    /// file has to be *fresh* — an open panel touches it every few seconds. A
+    /// killed panel can leave a pid that looks alive (an unreaped child is still
+    /// a process), so age is what settles it.
+    fn read(repo: &Repository) -> Option<Self> {
+        let path = repo.session_path();
+        let age = std::fs::metadata(&path)
+            .and_then(|file| file.modified())
+            .ok()?
+            .elapsed()
+            .unwrap_or_default();
+        if age > STALE {
+            return None;
+        }
+
+        let session: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+        let pid = session.get("pid").and_then(Value::as_u64)? as u32;
+        if !alive(pid) {
+            return None;
+        }
+        Some(Self {
+            pid,
+            rounds: session
+                .get("submit_to")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+        })
+    }
+}
+
+/// `kill(pid, 0)` sends no signal; it only asks whether the process is still
+/// there. Declared here rather than taking on a libc dependency for one call.
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn alive(_pid: u32) -> bool {
+    false
+}
+
+/// The panel being driven: one this call started, or one already open.
+enum Panel {
+    Ours(Child),
+    Theirs(u32),
+}
+
+impl Panel {
+    fn alive(&mut self, repo: &Repository) -> bool {
+        match self {
+            // A child is exact: no pid to race, no file to trust. `try_wait`
+            // also reaps it, so a closed panel leaves nothing behind.
+            Panel::Ours(child) => matches!(child.try_wait(), Ok(None)),
+            Panel::Theirs(pid) => Session::read(repo).is_some_and(|session| session.pid == *pid),
+        }
+    }
+}
+
+/// The panel for this tree, opening one only if none is up.
+///
+/// Every panel a client opens is launched the same way — `request --submit-to` —
+/// so submitting always leaves a round behind and never closes the window,
+/// whether or not anybody happened to be waiting at that moment.
+fn panel(args: &Value, repo: &Repository) -> Result<(Panel, PathBuf)> {
+    if let Some(session) = Session::read(repo) {
+        let rounds = session.rounds.unwrap_or_else(|| repo.rounds_dir());
+        return Ok((Panel::Theirs(session.pid), rounds));
+    }
+
+    let rounds = repo.rounds_dir();
+    let mut command = Command::new(binary()?);
+    command
+        .arg("request")
+        .arg(&repo.root)
+        .arg("--submit-to")
+        .arg(&rounds);
+    if let Some(base) = args.get("base").and_then(Value::as_str) {
+        command.arg("--base").arg(base);
+    }
+    for file in strings(args, "include") {
+        command.arg("--include").arg(file);
+    }
+
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("could not open the review panel")?;
+
+    // A panel takes a moment to come up and announce itself. Waiting for that
+    // here is what stops a second call arriving mid-boot from opening a second
+    // window over the same review. A panel that never announces itself is still
+    // returned: the caller finds out from its exit, not from this.
+    let ready = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < ready && Session::read(repo).is_none() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok((Panel::Ours(child), rounds))
+}
+
+/// Open the panel, and either wait for a round or leave the person to it.
 fn open_review<W: Write>(
     args: &Value,
     default_repo: &Path,
@@ -368,99 +518,70 @@ fn open_review<W: Write>(
     progress: &mut Progress<W>,
 ) -> Result<String> {
     let repo = repository(args, default_repo)?;
-    let base = args.get("base").and_then(Value::as_str);
-
-    let mut command = Command::new(binary()?);
-    command
-        .arg(if wait { "request" } else { "open" })
-        .arg(&repo.root);
-    if let Some(base) = base {
-        command.arg("--base").arg(base);
-    }
-    for file in strings(args, "include") {
-        command.arg("--include").arg(file);
-    }
-
-    let described = base.map(|base| Base::parse(base).label());
+    let described = args
+        .get("base")
+        .and_then(Value::as_str)
+        .map(|base| Base::parse(base).label());
     let described = described.as_deref().unwrap_or("the working tree");
 
+    let (mut panel, rounds) = panel(args, &repo)?;
+
     if !wait {
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::null());
-        command.spawn().context("could not open the review panel")?;
         return Ok(format!(
-            "Opened ReviewPad on {} for {described}. Nothing will tell you when the \
-             review is finished — poll `list_comments`, which sees comments as they \
-             are made. To be handed the finished review instead, call `request_review`.",
+            "Opened ReviewPad on {} for {described}. Nothing will tell you when a round \
+             is submitted — poll `list_comments`, which sees comments as they are made. \
+             To be handed each round as it is sent instead, call `request_review`.",
             repo.root.display()
         ));
     }
-
-    // The panel prints the finished review, and that has to land somewhere it
-    // can be read *after* a timeout. A pipe cannot: dropping this end of it
-    // leaves the app writing into a closed one when the person finally clicks
-    // Finish, half an hour later. A file is always there to be written to.
-    let transcript = scratch_path();
-    let sink = std::fs::File::create(&transcript)
-        .with_context(|| format!("could not open {}", transcript.display()))?;
-
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(sink))
-        .spawn()
-        .context("could not open the review panel")?;
 
     let seconds = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT);
-
-    if !waited_out(&mut child, Duration::from_secs(seconds), progress)? {
-        // Still open after the cap. The window is left alone — killing it would
-        // throw away a review someone is in the middle of writing.
-        return Ok(format!(
-            "The review panel is still open after {seconds}s. It has been left running, \
-             and comments are saved as they are made — poll `list_comments`, or call \
-             `request_review` again to keep waiting.\n\n{}",
-            list_comments(args, default_repo)?
-        ));
-    }
-
-    let review = std::fs::read_to_string(&transcript).unwrap_or_default();
-    let _ = std::fs::remove_file(&transcript);
-
-    // Finishing prints the review; closing the window prints nothing, in which
-    // case whatever was saved is still worth returning.
-    if review.trim().is_empty() {
-        let saved = Review::open(&repo)?;
-        if saved.is_empty() {
-            return Ok(
-                "The review panel was closed without any comments. Nothing to implement."
-                    .to_string(),
-            );
-        }
-        return Ok(format!(
-            "The review panel was closed without clicking Finish review. Saved comments:\n\n{}",
-            saved.markdown(&repo.root)
-        ));
-    }
-    Ok(review)
-}
-
-/// Whether the panel closed within the cap, saying so as it waits.
-fn waited_out<W: Write>(
-    child: &mut Child,
-    timeout: Duration,
-    progress: &mut Progress<W>,
-) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     let started = Instant::now();
-    let deadline = started + timeout;
     let mut announced = Instant::now();
 
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
+    loop {
+        if let Some(round) = consume(&rounds)? {
+            return Ok(format!(
+                "{round}\nThe panel is still open. Reply in each thread with `reply` as you \
+                 work — the person is watching those replies arrive — then call \
+                 `request_review` again to wait for their next round, or `close_review` \
+                 when the exchange is done."
+            ));
         }
+
+        if !panel.alive(&repo) {
+            // It may have submitted and closed in the same breath.
+            if let Some(round) = consume(&rounds)? {
+                return Ok(round);
+            }
+            let saved = Review::open(&repo)?;
+            if saved.is_empty() {
+                return Ok(
+                    "The review panel was closed without any comments. Nothing to implement."
+                        .to_string(),
+                );
+            }
+            return Ok(format!(
+                "The review panel was closed without submitting a round. Saved comments:\n\n{}",
+                saved.markdown(&repo.root)
+            ));
+        }
+
+        if Instant::now() >= deadline {
+            // Still open after the cap. The window is left alone — killing it
+            // would throw away a review someone is in the middle of writing.
+            return Ok(format!(
+                "No round submitted in {seconds}s. The panel has been left open, and comments \
+                 are saved as they are made — call `request_review` again to keep waiting, or \
+                 poll `list_comments`.\n\n{}",
+                list_comments(args, default_repo)?
+            ));
+        }
+
         if announced.elapsed() >= HEARTBEAT {
             announced = Instant::now();
             progress.tick(&format!(
@@ -470,18 +591,75 @@ fn waited_out<W: Write>(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Ok(false)
 }
 
-/// A private file for one panel's output. There is no randomness to hand, so
-/// the process and the clock name it — two reviews opened in the same
-/// nanosecond by the same server would be the collision, which is not a thing.
-fn scratch_path() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!("reviewpad-{}-{stamp}.md", std::process::id()))
+/// Take every round waiting to be read, oldest first, and delete them.
+///
+/// Deleting is what makes the *next* submission a new round rather than this one
+/// again. More than one can be waiting: the person is free to send a second
+/// round before this call came back for the first.
+fn consume(directory: &Path) -> Result<Option<String>> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Ok(None);
+    };
+
+    let mut rounds: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        // A round being written is a dot-file with a `.part` name until the
+        // rename, so only finished ones are ever picked up.
+        .filter(|path| path.extension().is_some_and(|kind| kind == "md"))
+        .collect();
+    rounds.sort();
+
+    let mut text = String::new();
+    for round in &rounds {
+        let Ok(body) = std::fs::read_to_string(round) else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push_str("\n---\n\n");
+        }
+        text.push_str(&body);
+        let _ = std::fs::remove_file(round);
+    }
+
+    Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// Ask the panel to close, and report anything it had not handed over yet.
+fn close_review(args: &Value, default_repo: &Path) -> Result<String> {
+    let repo = repository(args, default_repo)?;
+    let Some(session) = Session::read(&repo) else {
+        return Ok("No review panel is open for this working tree.".to_string());
+    };
+
+    let waiting = consume(&session.rounds.unwrap_or_else(|| repo.rounds_dir()))?;
+    let request = repo.close_path();
+    if let Some(parent) = request.parent() {
+        prepare_state_dir(parent)?;
+    }
+    std::fs::write(&request, "close\n")
+        .with_context(|| format!("could not write {}", request.display()))?;
+
+    // Asked, not killed: the panel saves and exits on its own, which a signal
+    // would not give it the chance to do. It watches four times a second, and
+    // takes its session file with it on the way out.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if Session::read(&repo).is_none() {
+            return Ok(match waiting {
+                Some(round) => format!(
+                    "Closed the review panel. It had submitted a round nobody had read \
+                     yet:\n\n{round}"
+                ),
+                None => "Closed the review panel.".to_string(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok("Asked the review panel to close; it has not gone yet. It may be mid-save.".to_string())
 }
 
 fn list_files(args: &Value, default_repo: &Path) -> Result<String> {

@@ -42,7 +42,26 @@ jobs:
           VERSION=${TAG#v}
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ReviewPad-macos-universal.zip"
           SHA256=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
-          echo "reviewpad ${VERSION} sha256=${SHA256}"
+
+          # A tag carrying a pre-release suffix goes to its own cask, so testing
+          # a beta is one `brew install` rather than a manual unzip — and so it
+          # can never be handed to somebody who asked for the stable one.
+          if [ "${VERSION}" = "${VERSION#*-}" ]; then
+            TOKEN=reviewpad
+            NAME='ReviewPad'
+            GUARDS='  depends_on macos: :monterey'
+          else
+            TOKEN='reviewpad@beta'
+            NAME='ReviewPad (beta)'
+            # Both casks install /Applications/ReviewPad.app and link the same
+            # binary, so only one may be present. Homebrew is told rather than
+            # left to overwrite: `brew install --cask reviewpad` is how you go
+            # back, and it says so instead of silently winning. Stanza order is
+            # what `brew style` asks for.
+            GUARDS='  conflicts_with cask: "shkumbinhasani/tap/reviewpad"
+            depends_on macos: :monterey'
+          fi
+          echo "${TOKEN} ${VERSION} sha256=${SHA256}"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap
@@ -53,17 +72,17 @@ jobs:
           git clone --depth 1 git@github.com:shkumbinhasani/homebrew-tap.git /tmp/tap
           mkdir -p /tmp/tap/Casks
 
-          cat > /tmp/tap/Casks/reviewpad.rb <<CASK
-          cask "reviewpad" do
+          cat > "/tmp/tap/Casks/${TOKEN}.rb" <<CASK
+          cask "${TOKEN}" do
             version "${VERSION}"
             sha256 "${SHA256}"
 
             url "https://github.com/shkumbinhasani/reviewpad/releases/download/v#{version}/ReviewPad-macos-universal.zip"
-            name "ReviewPad"
+            name "${NAME}"
             desc "Local-first Git review app built on GPUI"
             homepage "https://github.com/shkumbinhasani/reviewpad"
 
-            depends_on macos: :monterey
+          ${GUARDS}
 
             app "ReviewPad.app"
             binary "#{appdir}/ReviewPad.app/Contents/MacOS/reviewpad"
@@ -84,10 +103,10 @@ jobs:
           cd /tmp/tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/reviewpad.rb
+          git add "Casks/${TOKEN}.rb"
           if git diff --cached --quiet; then
             echo "cask already up to date"
             exit 0
           fi
-          git commit -m "reviewpad ${VERSION}"
+          git commit -m "${TOKEN} ${VERSION}"
           git push

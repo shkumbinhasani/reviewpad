@@ -215,6 +215,109 @@ fn a_branch_review_is_reachable_through_the_tools() {
     assert_eq!(review["base"], "main...HEAD");
 }
 
+/// The round trip, with a stand-in for the panel.
+///
+/// A live process that has announced itself in the session file is all the
+/// server needs to drive a review, so the whole handover — a round read and
+/// consumed, the window left open, a close asked for rather than forced — can be
+/// exercised without a window on screen. The stand-in behaves the way the panel
+/// does: it waits for the close request, then takes its session file with it.
+#[test]
+fn a_round_reaches_the_agent_and_leaves_the_panel_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.email", "reviewpad@example.com"]);
+    git(root, &["config", "user.name", "ReviewPad Test"]);
+    std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "initial"]);
+    std::fs::write(root.join("src.rs"), "fn main() {\n    work();\n}\n").unwrap();
+
+    let state = root.join(".reviewpad");
+    let rounds = state.join("rounds");
+    let session = state.join("session.json");
+    let close = state.join("close");
+    std::fs::create_dir_all(&rounds).unwrap();
+
+    let mut panel = Command::new("sh")
+        .arg("-c")
+        .arg("while [ ! -f \"$1\" ]; do sleep 0.05; done; rm -f \"$2\"")
+        .arg("panel")
+        .arg(&close)
+        .arg(&session)
+        .spawn()
+        .expect("could not start the stand-in panel");
+    std::fs::write(
+        &session,
+        json!({ "pid": panel.id(), "submit_to": rounds.display().to_string() }).to_string(),
+    )
+    .unwrap();
+
+    let mut server = Server::start(root);
+
+    // A round the person submitted before anybody asked for it. Waiting is not
+    // required for it to be kept, and the next request is handed it.
+    std::fs::write(
+        rounds.join("00000000000000000001.md"),
+        "# Code review\n\nRename `work` to something honest.\n",
+    )
+    .unwrap();
+
+    let round = server.call("request_review", json!({}));
+    assert!(round.contains("Rename `work`"), "{round}");
+    // The panel is still up, and the answer says how to use it.
+    assert!(round.contains("still open"), "{round}");
+    assert!(round.contains("reply"), "{round}");
+    assert!(session.exists(), "the panel was closed by being read");
+
+    // Consumed: the same notes are not handed out again as a second round.
+    assert_eq!(waiting_rounds(&rounds), 0);
+
+    // The person can answer a reply with another round, which the next request
+    // picks up on its own.
+    std::fs::write(
+        rounds.join("00000000000000000002.md"),
+        "# Code review\n\nStill reads oddly.\n",
+    )
+    .unwrap();
+    let second = server.call("request_review", json!({}));
+    assert!(second.contains("Still reads oddly"), "{second}");
+    assert!(!second.contains("Rename `work`"), "{second}");
+
+    // Closing asks rather than kills, and reports a round nobody had read.
+    std::fs::write(
+        rounds.join("00000000000000000003.md"),
+        "# Code review\n\nOne last thing.\n",
+    )
+    .unwrap();
+    let closed = server.call("close_review", json!({}));
+    assert!(closed.contains("Closed the review panel"), "{closed}");
+    assert!(closed.contains("One last thing"), "{closed}");
+    assert!(close.exists(), "the close was never requested");
+
+    let _ = panel.wait();
+
+    // With no panel open there is nothing to close, and saying so is not a
+    // failure the model has to handle.
+    let again = server.call("close_review", json!({}));
+    assert!(again.contains("No review panel is open"), "{again}");
+}
+
+/// Rounds submitted but not yet read.
+fn waiting_rounds(directory: &Path) -> usize {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "md")
+        })
+        .count()
+}
+
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)

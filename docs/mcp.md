@@ -5,14 +5,19 @@ over stdio. It is a plain subcommand of the CLI you already have — no daemon, 
 port, no separate install. The client starts it, talks to it on stdin and
 stdout, and stops it by closing the pipe.
 
-What an agent gets from it: a way to ask *you* to look at a change, and then
-read what you said.
+What an agent gets from it: a way to ask *you* to look at a change, and then a
+conversation about it. The panel stays open the whole time, and the agent's
+answers appear in it as it writes them.
 
 ```
 agent finishes a change
   └─ request_review  → your review panel opens
-                     → you comment, click Finish review
-                     → the agent gets your notes as a Markdown brief
+                     → you draft notes, press Send
+                     → the agent gets that round as a Markdown brief
+     reply           → its answers appear in the panel you are still reading
+  └─ request_review  → waits for your next round
+                     → you answer, or press Send with nothing left to say
+     close_review    → the panel closes, unless you closed it first
 ```
 
 ## Install it in your client
@@ -197,7 +202,8 @@ not name one; it defaults to the directory the client starts the server in.
 | Tool | What it does |
 | --- | --- |
 | `open_review` | Open the panel and return at once |
-| `request_review` | Open the panel and wait for **Finish review**, then return the Markdown |
+| `request_review` | Open the panel and wait for a round of notes, then return the Markdown |
+| `close_review` | Ask the open panel to close, once the exchange is done |
 | `list_files` | The files under review, with their line counts |
 | `list_comments` | Every comment and reply, as JSON, with ids |
 | `export_review` | The review as an implementation brief |
@@ -209,11 +215,36 @@ not name one; it defaults to the directory the client starts the server in.
 Every tool takes an optional `repo`, and the ones that read a diff take an
 optional `base` — `"main"` reviews `main...HEAD` rather than uncommitted work.
 
+## Rounds
+
+A note you write in the panel is a **draft** until you press Send. Drafts are
+yours: `list_comments` shows them marked `submitted: false`, and the tool
+descriptions tell the agent not to act on them. Pressing Send turns every draft
+into a **round** and hands it over — and leaves the window open.
+
+That is the part worth knowing. The agent replies in each thread as it works, and
+those replies appear in your panel within a second of being written, so you watch
+it work rather than waiting for a summary. Answer them by writing more notes and
+pressing Send again; the agent's next `request_review` is handed that round.
+Nothing left to say is also an answer: Send with no drafts tells the agent you
+read its replies and are content, rather than leaving it waiting.
+
+Only one panel is ever open per working tree. A panel announces itself in
+`.reviewpad/session.json`, so a second `request_review` drives the window
+already on screen instead of stacking another over the same review.
+
+Either side can end it: close the window, or let the agent call `close_review`,
+which asks the panel to save and exit rather than killing it.
+
+A round submitted while nobody is waiting is not lost — it sits in
+`.reviewpad/rounds` until the next `request_review` reads it. So reviewing before
+the agent gets around to asking works fine.
+
 ## Waiting for a person
 
-`request_review` blocks until you click **Finish review**. That is the point of
-it, and it is also the one thing a protocol built for fast tool calls finds
-surprising. Two ways through:
+`request_review` blocks until you send a round. That is the point of it, and it
+is also the one thing a protocol built for fast tool calls finds surprising. Two
+ways through:
 
 - **Let it block** — the default, and what an agent should reach for. The
   server emits a progress notification every 20 seconds, which is what keeps
@@ -221,13 +252,14 @@ surprising. Two ways through:
   how long you actually take. Claude Code moves a call this long to a background
   task and picks it up when it returns, so the session is not held hostage.
 - **Don't block.** `open_review` returns as soon as the window is up, and then
-  nothing announces that you are done — the agent has to poll `list_comments`
-  and judge for itself. Comments are written to `.reviewpad` as they are made,
-  so polling does see them arrive.
+  nothing announces that you have sent anything — the agent has to poll
+  `list_comments` and judge for itself. Comments are written to `.reviewpad` as
+  they are made, so polling does see them arrive.
 
 If the wait does time out, the window is left open — killing it would throw away
 a review you were in the middle of writing — and the call returns whatever has
-been saved so far.
+been saved so far. Calling `request_review` again keeps waiting on the same
+panel.
 
 ## Checking it works
 
