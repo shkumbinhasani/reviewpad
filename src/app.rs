@@ -19,6 +19,7 @@ use reviewpad::{
     avatar,
     field::{self, FieldStyle, TextField},
     git::{Base, DiffLine, DiffSet, FileDiff, LineKind, Repository},
+    markdown,
     media::{self, Medium, Probe},
     player::Player,
     review::{Anchor, OrderedF64, Review, ReviewComment, Spot, prepare_state_dir, thread_of},
@@ -281,6 +282,57 @@ fn nothing_further(root: &Path) -> String {
     )
 }
 
+/// Where the row that was under the top edge has moved to in a new plan.
+///
+/// By what the row *is*, not where it was: a note added to an earlier line, or a
+/// reply arriving from an agent, pushes everything below it down, and an index
+/// carried across would slide the diff by exactly that much. When the row is
+/// gone altogether — its file no longer shown, its thread deleted — the old
+/// index, clamped, is the best guess left.
+fn kept_position(previous: &[DiffRow], rows: &[DiffRow], was: usize) -> usize {
+    previous
+        .get(was)
+        .and_then(|row| rows.iter().position(|candidate| candidate == row))
+        .unwrap_or_else(|| was.min(rows.len()))
+}
+
+/// Inline emphasis, as one run of text that wraps like prose.
+///
+/// The runs carry weight, slant and colour but not a font: a gpui highlight
+/// cannot change family mid-line, so inline code is marked with a tinted chip
+/// colour rather than by being monospaced. A fenced block — where mono actually
+/// earns its keep — is drawn as its own element instead.
+fn styled_spans(spans: Vec<markdown::Span>) -> StyledText {
+    let mut text = String::new();
+    let mut runs = Vec::new();
+
+    for span in spans {
+        let start = text.len();
+        text.push_str(&span.text);
+
+        let mut style = HighlightStyle::default();
+        let mut styled = false;
+        if span.strong {
+            style.font_weight = Some(FontWeight::SEMIBOLD);
+            styled = true;
+        }
+        if span.emphasis {
+            style.font_style = Some(gpui::FontStyle::Italic);
+            styled = true;
+        }
+        if span.code {
+            style.color = Some(tint(ACCENT, 0.95));
+            style.background_color = Some(fg(0.08));
+            styled = true;
+        }
+        if styled {
+            runs.push((start..text.len(), style));
+        }
+    }
+
+    StyledText::new(text).with_highlights(runs)
+}
+
 /// Mark a region as window chrome: dragging it moves the window.
 fn draggable(element: gpui::Div) -> gpui::Div {
     element.on_mouse_down(MouseButton::Left, |_, _, _| window_drag::start())
@@ -327,7 +379,10 @@ type Detach = Box<dyn Fn(&mut ReviewView, &mut Window, &mut Context<ReviewView>)
 /// The pane used to build every row of the selected file each frame — 7,086 of
 /// them for a transcript in a real project. Planning them costs a vector of
 /// small enums; only the rows on screen are ever built.
-#[derive(Clone)]
+///
+/// Comparable, so a re-plan can find the row the person was looking at rather
+/// than guessing at an index.
+#[derive(Clone, PartialEq, Eq)]
 enum DiffRow {
     /// A hunk header or a metadata line, drawn as a full-width band.
     Band(usize),
@@ -709,6 +764,7 @@ impl Focusable for ReviewView {
 
 impl ReviewView {
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let moved = index != self.selected_file;
         self.selected_file = index;
         self.anchor = None;
         self.reply_to = None;
@@ -716,6 +772,9 @@ impl ReviewView {
         self.refresh_highlight();
         self.refresh_medium(cx);
         self.plan_diff();
+        if moved {
+            self.scroll_diff_to_top();
+        }
         cx.notify();
     }
 
@@ -1635,6 +1694,7 @@ impl ReviewView {
             .path
             .rsplit_once('/')
             .map_or(file.path.as_str(), |(_, name)| name);
+        let (notes, drafting) = self.review.notes_on(&file.path);
         let (status_color, status_symbol) = if file.additions > 0 && file.deletions > 0 {
             (TINT_MODIFIED, "•")
         } else if file.additions > 0 {
@@ -1716,18 +1776,54 @@ impl ReviewView {
                 div()
                     .flex_none()
                     .flex()
-                    .gap(px(5.))
-                    .text_size(px(10.))
-                    .font_family(MONO)
+                    .items_center()
+                    .gap(px(6.))
+                    // Which files hold notes, without opening them. Gold means
+                    // notes still waiting to be sent — the ones the round is
+                    // going to be made of — and grey means already handed over,
+                    // so a glance down the column says what is left to do.
+                    .when(notes > 0, |element| {
+                        let (fill, ring, text) = if drafting {
+                            (hex(ACCENT_FILL), tint(ACCENT, 0.4), tint(ACCENT, 0.98))
+                        } else {
+                            (fg(0.08), fg(0.14), ink())
+                        };
+                        element.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(3.))
+                                .h(px(15.))
+                                .px(px(5.))
+                                .rounded_full()
+                                .bg(fill)
+                                .border_1()
+                                .border_color(ring)
+                                .font_family(MONO)
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text)
+                                .child(format!("{notes} ⌸")),
+                        )
+                    })
                     .child(
                         div()
-                            .text_color(hex(ADD_MARK))
-                            .child(format!("+{}", file.additions)),
-                    )
-                    .child(
-                        div()
-                            .text_color(hex(DEL_MARK))
-                            .child(format!("−{}", file.deletions)),
+                            .flex_none()
+                            .flex()
+                            .gap(px(5.))
+                            .text_size(px(10.))
+                            .font_family(MONO)
+                            .child(
+                                div()
+                                    .text_color(hex(ADD_MARK))
+                                    .child(format!("+{}", file.additions)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(hex(DEL_MARK))
+                                    .child(format!("−{}", file.deletions)),
+                            ),
                     ),
             )
     }
@@ -1918,6 +2014,103 @@ impl ReviewView {
     /// One message in a thread: who wrote it, its id, and the prose. Replies
     /// reuse this so a thread reads as a conversation rather than a stack of
     /// differently-shaped boxes.
+    /// A note drawn the way it was written.
+    ///
+    /// Agents answer in Markdown whether or not anybody asked them to, and a
+    /// note showing the source of that makes the person read punctuation
+    /// instead of the answer. Nothing here is clickable and nothing reflows the
+    /// thread: it is the same text, given the shape it was typed in.
+    fn render_body(&self, body: &str) -> gpui::Div {
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.))
+            .text_size(px(13.))
+            .line_height(px(19.))
+            .text_color(fg(0.84));
+
+        for block in markdown::parse(body) {
+            column = column.child(match block {
+                markdown::Block::Paragraph(spans) => div()
+                    .whitespace_normal()
+                    .child(styled_spans(spans))
+                    .into_any_element(),
+                markdown::Block::Heading { spans, .. } => div()
+                    .whitespace_normal()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(fg(0.94))
+                    .child(styled_spans(spans))
+                    .into_any_element(),
+                markdown::Block::Item { marker, spans } => div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_w(px(13.))
+                            .text_color(fg(0.5))
+                            .child(marker),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .whitespace_normal()
+                            .child(styled_spans(spans)),
+                    )
+                    .into_any_element(),
+                markdown::Block::Quote(spans) => div()
+                    .pl(px(8.))
+                    .border_l_2()
+                    .border_color(fg(0.16))
+                    .whitespace_normal()
+                    .text_color(fg(0.6))
+                    .child(styled_spans(spans))
+                    .into_any_element(),
+                markdown::Block::Rule => div()
+                    .my(px(2.))
+                    .h(px(1.))
+                    .w_full()
+                    .bg(fg(0.12))
+                    .into_any_element(),
+                markdown::Block::Code { language, text } => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .when_some(language, |element, language| {
+                        element.child(
+                            div()
+                                .font_family(MONO)
+                                .text_size(px(9.5))
+                                .text_color(fg(0.42))
+                                .child(language),
+                        )
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(6.))
+                            .bg(scrim(0.32))
+                            .border_1()
+                            .border_color(fg(0.1))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .font_family(MONO)
+                            .text_size(px(11.5))
+                            .line_height(px(17.))
+                            .text_color(fg(0.88))
+                            // Wrapped rather than clipped: a long line in a
+                            // narrow notes column is worth reading awkwardly,
+                            // and not worth losing.
+                            .whitespace_normal()
+                            .child(text),
+                    )
+                    .into_any_element(),
+            });
+        }
+        column
+    }
+
     fn render_message(&self, message: Message<'_>, cx: &mut Context<Self>) -> gpui::Div {
         let Message {
             key,
@@ -2012,14 +2205,7 @@ impl ReviewView {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .whitespace_normal()
-                    .text_size(px(13.))
-                    .line_height(px(19.))
-                    .text_color(fg(0.84))
-                    .child(body),
-            )
+            .child(self.render_body(&body))
             .when_some(
                 attachment.filter(|attachment| !attachment.is_empty()),
                 |element, attachment| {
@@ -2317,8 +2503,7 @@ impl ReviewView {
     fn plan_diff(&mut self) {
         let mut rows = Vec::new();
         let Some(file) = self.diff.files.get(self.selected_file) else {
-            self.diff_rows = rows;
-            self.diff_list = ListState::new(0, ListAlignment::Top, px(600.));
+            self.settle_diff_rows(rows);
             return;
         };
 
@@ -2360,8 +2545,35 @@ impl ReviewView {
             }
         }
 
-        self.diff_list = ListState::new(rows.len(), ListAlignment::Top, px(600.));
+        self.settle_diff_rows(rows);
+    }
+
+    /// Swap in a new row plan, keeping the person's place in the diff.
+    ///
+    /// Replacing the list state — which is what this used to do — starts it at
+    /// the top, and re-planning happens on every click that opens a composer,
+    /// every note saved, and every reply an agent writes while the panel is
+    /// open. None of those are a reason to lose your place in a seven-thousand
+    /// row diff. The row that was under the top edge is found again by what it
+    /// is rather than by its index, so rows appearing above it do not drag the
+    /// view either.
+    fn settle_diff_rows(&mut self, rows: Vec<DiffRow>) {
+        let was = self.diff_list.logical_scroll_top();
+        let item_ix = kept_position(&self.diff_rows, &rows, was.item_ix);
+
+        self.diff_list.reset(rows.len());
+        self.diff_list.scroll_to(gpui::ListOffset {
+            item_ix,
+            offset_in_item: was.offset_in_item,
+        });
+
         self.diff_rows = rows;
+    }
+
+    /// Back to the top, for when the diff on screen is a different file
+    /// entirely and keeping a scroll position would be keeping the wrong one.
+    fn scroll_diff_to_top(&mut self) {
+        self.diff_list.scroll_to(gpui::ListOffset::default());
     }
 
     /// Build one planned row.
@@ -3440,7 +3652,9 @@ impl Render for ReviewView {
                     .flex()
                     // The row is dragged narrower by the sidebar divider, so it
                     // gives way by wrapping rather than by spilling its buttons
-                    // out over the diff.
+                    // out over the diff. Clipped as well as wrapped: whatever a
+                    // label grows into later, it cannot paint over the card.
+                    .overflow_hidden()
                     .flex_wrap()
                     .items_center()
                     .gap(px(6.))
@@ -3647,6 +3861,37 @@ mod tests {
         let (text, highlights) = expand_tabs("let x", &[(0..3, 9)]);
         assert_eq!(text.as_ref(), "let x");
         assert_eq!(highlights[0].0, 0..3);
+    }
+
+    /// Clicking a note, or a reply arriving, re-plans the rows. The person's
+    /// place in the diff has to survive that — losing it was the bug.
+    #[test]
+    fn a_re_plan_keeps_the_row_that_was_on_screen() {
+        let before = vec![DiffRow::Code(10), DiffRow::Code(11), DiffRow::Code(12)];
+
+        // A thread opens above the row being looked at: it moves down by one,
+        // and so does the view.
+        let after = vec![
+            DiffRow::Code(10),
+            DiffRow::Thread(0),
+            DiffRow::Code(11),
+            DiffRow::Code(12),
+        ];
+        assert_eq!(kept_position(&before, &after, 1), 2);
+
+        // A composer opening under the row itself does not move it.
+        let after = vec![
+            DiffRow::Code(10),
+            DiffRow::Code(11),
+            DiffRow::Composer(11),
+            DiffRow::Code(12),
+        ];
+        assert_eq!(kept_position(&before, &after, 1), 1);
+
+        // The row is gone: fall back to the index, clamped to what there is.
+        assert_eq!(kept_position(&before, &[DiffRow::Band(0)], 2), 1);
+        // Nothing to keep at all.
+        assert_eq!(kept_position(&[], &[], 0), 0);
     }
 
     /// A round is handed over as a finished file or not at all: a reader polling

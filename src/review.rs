@@ -323,6 +323,24 @@ impl Review {
         }
     }
 
+    /// How many notes a file carries, and whether any of them are still drafts.
+    ///
+    /// Counted per thread rather than per message: what a glance down the
+    /// sidebar wants to know is how many things were raised about the file, not
+    /// how long the conversations ran.
+    pub fn notes_on(&self, path: &str) -> (usize, bool) {
+        let mut notes = 0;
+        let mut drafting = false;
+        for comment in &self.comments {
+            if comment.path != path {
+                continue;
+            }
+            notes += 1;
+            drafting |= !comment.submitted;
+        }
+        (notes, drafting)
+    }
+
     /// How many replies the review holds, which is how the panel notices that
     /// somebody else has answered while it was open.
     pub fn reply_count(&self) -> usize {
@@ -591,6 +609,30 @@ mod tests {
         assert_eq!(round.comments[0].body, "Second note.");
         // The base travels with it: line numbers mean nothing without one.
         assert_eq!(round.base, review.base);
+    }
+
+    /// The sidebar badge: how many notes a file holds, and whether any of them
+    /// are the person's own unsent ones — which is the difference between "there
+    /// is something here" and "there is something here I still owe".
+    #[test]
+    fn notes_are_counted_per_file_with_drafts_flagged() {
+        let mut review = review();
+        review.add_comment("src/other.rs", Anchor::File, "you", "Second.", "");
+        review.add_reply("c1", "claude", "Fixed.").unwrap();
+
+        // A thread counts once, however long it ran.
+        assert_eq!(review.notes_on("src/lib.rs"), (1, true));
+        assert_eq!(review.notes_on("src/other.rs"), (1, true));
+        // Nothing at all on a file nobody wrote about.
+        assert_eq!(review.notes_on("src/untouched.rs"), (0, false));
+
+        let sent = review.draft_ids();
+        review.mark_submitted(&sent);
+        assert_eq!(review.notes_on("src/lib.rs"), (1, false));
+
+        // A new note on a file that already has a sent one is still owed.
+        review.add_comment("src/lib.rs", Anchor::File, "you", "One more.", "");
+        assert_eq!(review.notes_on("src/lib.rs"), (2, true));
     }
 
     #[test]

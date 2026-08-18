@@ -125,7 +125,7 @@ because a line number only means something against a particular diff. Pass the
 same `--base` to `reviewpad comment` so an agent's notes land on the lines it
 meant.
 
-Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish** saves and closes the panel — when an agent is waiting, that button becomes **Send 3** and the panel stays open for the reply, reading **Waiting…** once the round is away.
+Select a changed file, click a code line, type a comment, and press `Cmd+Enter` (or click **Add comment**). The sidebar marks which files carry notes and how many — gold while they are still drafts of yours, grey once they have been sent — so a glance down the column says what is left to do. **Copy Markdown** puts the complete implementation brief on the clipboard. **Finish** saves and closes the panel — when an agent is waiting, that button becomes **Send 3** and the panel stays open for the reply, reading **Waiting…** once the round is away.
 
 ## Use it from an AI agent
 
@@ -148,6 +148,15 @@ reviewpad export .   # print the current review as Markdown
 reviewpad list .     # list comments with their ids
 reviewpad clear .    # remove all saved comments
 ```
+
+### Notes are Markdown
+
+An agent answers in Markdown whether or not it was asked to, so the panel reads
+it as Markdown: backticked identifiers, `**emphasis**`, bullet and numbered
+lists, block quotes, and fenced code blocks drawn as monospaced blocks with
+their language named. Anything it does not recognize is left as the characters
+that were typed, so nothing you write can disappear into punctuation. Underscores
+are deliberately not emphasis — `snake_case` names survive intact.
 
 ### Reviewing renders
 

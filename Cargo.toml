@@ -1,6 +1,6 @@
 [package]
 name = "reviewpad"
-version = "0.8.0-rc.2"
+version = "0.8.0-rc.3"
 edition = "2024"
 description = "A local-first GPUI code review app and agent-friendly CLI"
 license = "MIT"
